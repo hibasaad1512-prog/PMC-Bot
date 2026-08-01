@@ -4,7 +4,6 @@ import re
 import time
 from typing import Optional
 from urllib.parse import urlparse, unquote
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Flask, abort, request
 import telebot
@@ -378,6 +377,7 @@ def get_group_resolver_bots():
     return resolver_bots
 
 
+
 def _copy_or_forward_message(target_bot, chat_id: int, source_chat_id: int, source_message_id: int):
     copier = getattr(target_bot, "copy_message", None)
     if callable(copier):
@@ -386,41 +386,133 @@ def _copy_or_forward_message(target_bot, chat_id: int, source_chat_id: int, sour
     target_bot.forward_message(chat_id=chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
 
 
+def extract_broadcast_payload(message):
+    """
+    Capture the incoming message in a bot-agnostic structure so follower bots
+    can send it themselves, without needing access to the engine's private chat.
+    """
+    content_type = getattr(message, "content_type", None) or (
+        "text" if getattr(message, "text", None) else "unknown"
+    )
 
-def broadcast_message_to_groups(source_chat_id: int, source_message_id: int, repeats: int = 1, delay_seconds: int = 0):
+    payload = {
+        "type": content_type,
+        "text": None,
+        "file_id": None,
+        "caption": None,
+    }
+
+    if content_type == "text":
+        payload["text"] = getattr(message, "text", "") or ""
+        return payload
+
+    if content_type == "photo":
+        photos = getattr(message, "photo", None) or []
+        if photos:
+            payload["file_id"] = photos[-1].file_id
+        payload["caption"] = getattr(message, "caption", None)
+        return payload
+
+    if content_type in {"video", "document", "audio", "voice", "animation", "sticker"}:
+        obj = getattr(message, content_type, None)
+        if obj is not None:
+            payload["file_id"] = getattr(obj, "file_id", None)
+        if content_type != "sticker":
+            payload["caption"] = getattr(message, "caption", None)
+        return payload
+
+    # Fallback for any unsupported type; we'll try to use text if present.
+    payload["text"] = getattr(message, "text", None)
+    payload["caption"] = getattr(message, "caption", None)
+    return payload
+
+
+def send_payload_with_bot(target_bot, chat_id: int, payload: dict):
+    content_type = payload.get("type") or "text"
+
+    if content_type == "text":
+        text = payload.get("text") or ""
+        return target_bot.send_message(chat_id, text)
+
+    file_id = payload.get("file_id")
+    caption = payload.get("caption")
+
+    if content_type == "photo":
+        return target_bot.send_photo(chat_id, file_id, caption=caption or None)
+    if content_type == "video":
+        return target_bot.send_video(chat_id, file_id, caption=caption or None)
+    if content_type == "document":
+        return target_bot.send_document(chat_id, file_id, caption=caption or None)
+    if content_type == "audio":
+        return target_bot.send_audio(chat_id, file_id, caption=caption or None)
+    if content_type == "voice":
+        return target_bot.send_voice(chat_id, file_id, caption=caption or None)
+    if content_type == "animation":
+        return target_bot.send_animation(chat_id, file_id, caption=caption or None)
+    if content_type == "sticker":
+        return target_bot.send_sticker(chat_id, file_id)
+
+    # Safe fallback: try plain text if available.
+    text = payload.get("text") or caption or ""
+    return target_bot.send_message(chat_id, text)
+
+
+def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: int = 0):
     groups = list_groups(limit=10_000)
-
-    # Broadcast using the engine bot itself. Added bots are stored for the next phase,
-    # but they are not used for the current broadcast step.
-    total = len(groups) * max(1, int(repeats or 1))
-    sent = 0
-    failed = 0
+    managed_bots = get_managed_bot_instances()
 
     repeats = max(1, int(repeats or 1))
     delay_seconds = max(0, int(delay_seconds or 0))
 
-    def _send_once(chat_id: int):
+    if not groups or not managed_bots:
+        return len(groups) * len(managed_bots) * repeats, 0, len(groups) * len(managed_bots) * repeats
+
+    total = len(groups) * len(managed_bots) * repeats
+    sent = 0
+    failed = 0
+
+    def _broadcast_one(target_bot, bot_row, chat_id: int):
+        nonlocal sent, failed
         last_exc = None
-        for attempt in range(3):
+        for attempt in range(4):
             try:
-                _copy_or_forward_message(bot, chat_id, source_chat_id, source_message_id)
+                send_payload_with_bot(target_bot, chat_id, payload)
                 return True, None
             except ApiTelegramException as exc:
                 last_exc = exc
-                log.warning("Broadcast failed to %s: %s", chat_id, exc)
-                time.sleep(0.2 * (attempt + 1))
+                log.warning(
+                    "Broadcast failed to %s using %s: %s",
+                    chat_id,
+                    bot_row["id"] if bot_row else "engine",
+                    exc,
+                )
+                time.sleep(0.25 * (attempt + 1))
             except Exception as exc:
                 last_exc = exc
-                log.warning("Broadcast failed to %s: %s", chat_id, exc)
-                time.sleep(0.2 * (attempt + 1))
+                log.warning(
+                    "Broadcast failed to %s using %s: %s",
+                    chat_id,
+                    bot_row["id"] if bot_row else "engine",
+                    exc,
+                )
+                time.sleep(0.25 * (attempt + 1))
         return False, last_exc
 
+    # A small thread pool gives us much better throughput while keeping the
+    # bot stable on Render Free.
+    max_workers = min(16, max(4, len(managed_bots) * 2))
     for round_index in range(repeats):
-        max_workers = min(5, max(1, len(groups)))
+        futures = []
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_send_once, int(group["chat_id"])): int(group["chat_id"]) for group in groups}
+            for group in groups:
+                chat_id = int(group["chat_id"])
+                for bot_row, target_bot in managed_bots:
+                    futures.append(executor.submit(_broadcast_one, target_bot, bot_row, chat_id))
+
             for future in as_completed(futures):
-                ok, _exc = future.result()
+                ok, _err = future.result()
                 if ok:
                     sent += 1
                 else:
@@ -433,6 +525,7 @@ def broadcast_message_to_groups(source_chat_id: int, source_message_id: int, rep
 
 
 def render_group_hint():
+
     return (
         "Send a forwarded message from the target group, or send its @username, a t.me link, or numeric chat ID.\n"
         "You can also type a previously saved group name."
@@ -601,6 +694,9 @@ def broadcast_cmd(message):
     if count_groups() <= 0:
         bot.reply_to(message, t(lang, "broadcast_no_groups"))
         return
+    if count_bots() <= 0:
+        bot.reply_to(message, "No follower bots are active yet. Add at least one bot first.")
+        return
     reset_pending(message.from_user.id)
     set_state(message.from_user.id, "await_broadcast_repeats")
     bot.reply_to(
@@ -752,6 +848,14 @@ def menu_actions(call):
             send_or_edit(
                 call.message.chat.id,
                 t(lang, "broadcast_no_groups"),
+                main_menu_keyboard(call.from_user.id, lang),
+                call.message.message_id,
+            )
+            return
+        if count_bots() <= 0:
+            send_or_edit(
+                call.message.chat.id,
+                "No follower bots are active yet. Add at least one bot first.",
                 main_menu_keyboard(call.from_user.id, lang),
                 call.message.message_id,
             )
@@ -964,10 +1068,10 @@ def content_router(message):
     if state == "await_broadcast_content":
         repeats = max(1, int(row["pending_repeats"] or 1))
         delay = max(0, int(row["pending_delay"] or 0))
+        payload = extract_broadcast_payload(message)
         try:
             total, sent, failed = broadcast_message_to_groups(
-                message.chat.id,
-                message.message_id,
+                payload,
                 repeats=repeats,
                 delay_seconds=delay,
             )
