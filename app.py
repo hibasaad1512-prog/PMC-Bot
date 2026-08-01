@@ -577,6 +577,27 @@ def removegroup_cmd(message):
     show_remove_group_prompt(message.chat.id, message.from_user.id, page=0)
 
 
+@bot.message_handler(commands=["groups"])
+def groups_cmd(message):
+    ensure_user(message.from_user.id)
+    if not require_admin(message):
+        return
+    lang = current_lang(message.from_user.id)
+    groups = list_groups(offset=0, limit=100)
+    if not groups:
+        bot.reply_to(message, t(lang, "broadcast_no_groups"), reply_markup=main_menu_keyboard(message.from_user.id, lang))
+        return
+
+    lines = [f"{t(lang, 'stats_title')}"]
+    for row in groups:
+        title = (row["title"] or "Untitled group").strip()
+        chat_id = row["chat_id"]
+        username = row["username"] or ""
+        suffix = f" (@{username})" if username and not username.startswith("@") else (f" ({username})" if username else "")
+        lines.append(f"• {title}{suffix} — {chat_id}")
+    bot.reply_to(message, "\n".join(lines), reply_markup=main_menu_keyboard(message.from_user.id, lang))
+
+
 @bot.message_handler(commands=["broadcast"])
 def broadcast_cmd(message):
     ensure_user(message.from_user.id)
@@ -856,6 +877,11 @@ def content_router(message):
     if not row or not row["state"]:
         return
 
+    # Let dedicated command handlers process slash commands. This avoids
+    # swallowing /help, /start, /ping, /cancel, etc. while a flow is active.
+    if getattr(message, "text", None) and message.text.lstrip().startswith("/"):
+        return
+
     state = row["state"]
 
     if state == "await_bot_label":
@@ -958,16 +984,24 @@ def content_router(message):
     if state == "await_broadcast_content":
         repeats = max(1, int(row["pending_repeats"] or 1))
         delay = max(0, int(row["pending_delay"] or 0))
-        total, sent, failed = broadcast_message_to_groups(
-            message.chat.id,
-            message.message_id,
-            repeats=repeats,
-            delay_seconds=delay,
-        )
-        reset_pending(message.from_user.id)
+        try:
+            total, sent, failed = broadcast_message_to_groups(
+                message.chat.id,
+                message.message_id,
+                repeats=repeats,
+                delay_seconds=delay,
+            )
+            result_text = f"✅ Broadcast finished.\nAttempts: {total}\nSent: {sent}\nFailed: {failed}"
+        except Exception as exc:
+            log.exception("Broadcast crashed for user %s", message.from_user.id)
+            total = sent = 0
+            failed = 0
+            result_text = f"⚠️ Broadcast failed unexpectedly.\n{exc}"
+        finally:
+            reset_pending(message.from_user.id)
         bot.reply_to(
             message,
-            f"✅ Broadcast finished.\nAttempts: {total}\nSent: {sent}\nFailed: {failed}",
+            result_text,
             reply_markup=main_menu_keyboard(message.from_user.id, lang),
         )
         return
