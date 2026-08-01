@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import time
+import tempfile
 from typing import Optional
 from urllib.parse import urlparse, unquote
 
@@ -48,7 +49,45 @@ BOT_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
 
 BOT_ID: int | None = None
 
+SUPPORTED_BROADCAST_CONTENT_TYPES = [
+    "text",
+    "photo",
+    "video",
+    "document",
+    "audio",
+    "voice",
+    "sticker",
+    "animation",
+    "video_note",
+    "contact",
+    "location",
+    "venue",
+    "dice",
+    "poll",
+]
 
+
+BROADCAST_MEDIA_TYPES = {
+    "photo",
+    "video",
+    "document",
+    "audio",
+    "voice",
+    "animation",
+    "sticker",
+    "video_note",
+}
+
+BROADCAST_MEDIA_SUFFIXES = {
+    "photo": ".jpg",
+    "video": ".mp4",
+    "document": ".bin",
+    "audio": ".mp3",
+    "voice": ".ogg",
+    "animation": ".mp4",
+    "sticker": ".webp",
+    "video_note": ".mp4",
+}
 def _get_attr_or_key(obj, name, default=None):
     if obj is None:
         return default
@@ -425,6 +464,86 @@ def get_group_resolver_bots():
 
 
 
+
+def get_broadcast_worker_bots():
+    """
+    Returns the stored follower bots that should actually deliver broadcasts.
+    The engine bot is only used as a last fallback when no follower bots exist.
+    """
+    workers = []
+    seen_tokens = set()
+
+    for row in list_all_bots():
+        token = (row["token"] or "").strip()
+        if not token or token == BOT_TOKEN or token in seen_tokens:
+            continue
+
+        cached = _BOT_INSTANCE_CACHE.get(token)
+        if cached is None:
+            cached = telebot.TeleBot(token, parse_mode="HTML", threaded=False)
+            _BOT_INSTANCE_CACHE[token] = cached
+
+        workers.append((row, cached))
+        seen_tokens.add(token)
+
+    if not workers and BOT_TOKEN:
+        workers.append((None, bot))
+
+    return workers
+
+
+def _prepare_broadcast_media(payload: dict):
+    """
+    Download media once from the engine bot so every follower bot can reuse it.
+    This avoids relying on cross-bot file_id compatibility and is much more
+    reliable for photos, GIFs, voice notes, stickers, and documents.
+    """
+    content_type = payload.get("type") or "text"
+    file_id = payload.get("file_id")
+    if content_type not in BROADCAST_MEDIA_TYPES or not file_id:
+        return payload
+
+    if payload.get("local_path"):
+        return payload
+
+    try:
+        file_info = bot.get_file(file_id)
+        file_path = getattr(file_info, "file_path", None) or ""
+        suffix = BROADCAST_MEDIA_SUFFIXES.get(content_type) or os.path.splitext(file_path)[1] or ".bin"
+        downloaded = bot.download_file(file_info.file_path)
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        try:
+            tmp.write(downloaded)
+            tmp.flush()
+        finally:
+            tmp.close()
+
+        payload["local_path"] = tmp.name
+    except Exception as exc:
+        log.warning("Could not cache broadcast media (%s): %s", content_type, exc)
+
+    return payload
+
+
+def _cleanup_broadcast_media(payload: dict):
+    local_path = payload.get("local_path")
+    if not local_path:
+        return
+    try:
+        if os.path.exists(local_path):
+            os.unlink(local_path)
+    except Exception as exc:
+        log.debug("Could not remove temp media file %s: %s", local_path, exc)
+    finally:
+        payload.pop("local_path", None)
+
+
+def _bot_name(bot_row):
+    if not bot_row:
+        return "engine"
+    label = (bot_row["label"] or "").strip()
+    return f"{bot_row['id']}:{label}" if label else f"{bot_row['id']}"
 def _copy_or_forward_message(target_bot, chat_id: int, source_chat_id: int, source_message_id: int):
     copier = getattr(target_bot, "copy_message", None)
     if callable(copier):
@@ -437,6 +556,9 @@ def extract_broadcast_payload(message):
     """
     Capture the incoming message in a bot-agnostic structure so follower bots
     can send it themselves, without needing access to the engine's private chat.
+    When possible, we also keep the original source chat/message ids so the
+    engine bot can copy the message directly. That is much faster and supports
+    almost every Telegram message type.
     """
     content_type = getattr(message, "content_type", None) or (
         "text" if getattr(message, "text", None) else "unknown"
@@ -447,6 +569,13 @@ def extract_broadcast_payload(message):
         "text": None,
         "file_id": None,
         "caption": None,
+        "contact": None,
+        "location": None,
+        "venue": None,
+        "dice": None,
+        "poll": None,
+        "source_chat_id": getattr(getattr(message, "chat", None), "id", None),
+        "source_message_id": getattr(message, "message_id", None),
     }
 
     if content_type == "text":
@@ -460,15 +589,28 @@ def extract_broadcast_payload(message):
         payload["caption"] = getattr(message, "caption", None)
         return payload
 
-    if content_type in {"video", "document", "audio", "voice", "animation", "sticker"}:
+    if content_type in {"video", "document", "audio", "voice", "animation", "sticker", "video_note", "contact", "location", "venue", "dice", "poll"}:
         obj = getattr(message, content_type, None)
-        if obj is not None:
+        if obj is not None and content_type not in {"contact", "location", "venue", "dice", "poll"}:
             payload["file_id"] = getattr(obj, "file_id", None)
+        else:
+            payload[content_type] = obj
+        if content_type == "contact":
+            payload["contact"] = obj
+        elif content_type == "location":
+            payload["location"] = obj
+        elif content_type == "venue":
+            payload["venue"] = obj
+        elif content_type == "dice":
+            payload["dice"] = obj
+        elif content_type == "poll":
+            payload["poll"] = obj
         if content_type != "sticker":
             payload["caption"] = getattr(message, "caption", None)
         return payload
 
-    # Fallback for any unsupported type; we'll try to use text if present.
+    # Fallback for any unsupported type; the source ids still let copy_message
+    # do the heavy lifting on the engine bot.
     payload["text"] = getattr(message, "text", None)
     payload["caption"] = getattr(message, "caption", None)
     return payload
@@ -476,28 +618,147 @@ def extract_broadcast_payload(message):
 
 def send_payload_with_bot(target_bot, chat_id: int, payload: dict):
     content_type = payload.get("type") or "text"
+    caption = payload.get("caption")
+    file_id = payload.get("file_id")
+    local_path = payload.get("local_path")
+
+    # Best-effort copy for the engine bot only. Follower bots should send the
+    # payload directly so broadcasts do not depend on the engine's private chat.
+    if target_bot is bot:
+        source_chat_id = payload.get("source_chat_id")
+        source_message_id = payload.get("source_message_id")
+        copier = getattr(target_bot, "copy_message", None)
+        if callable(copier) and source_chat_id is not None and source_message_id is not None:
+            try:
+                return copier(
+                    chat_id=chat_id,
+                    from_chat_id=source_chat_id,
+                    message_id=source_message_id,
+                )
+            except Exception:
+                pass
 
     if content_type == "text":
         text = payload.get("text") or ""
         return target_bot.send_message(chat_id, text)
 
-    file_id = payload.get("file_id")
-    caption = payload.get("caption")
+    def _send_local_file(send_func, *args, **kwargs):
+        if local_path and os.path.exists(local_path):
+            with open(local_path, "rb") as fh:
+                return send_func(chat_id, fh, *args, **kwargs)
+        return None
 
     if content_type == "photo":
-        return target_bot.send_photo(chat_id, file_id, caption=caption or None)
+        sent = _send_local_file(target_bot.send_photo, caption=caption or None)
+        if sent is not None:
+            return sent
+        if file_id:
+            return target_bot.send_photo(chat_id, file_id, caption=caption or None)
+        return target_bot.send_message(chat_id, caption or "")
     if content_type == "video":
-        return target_bot.send_video(chat_id, file_id, caption=caption or None)
+        sent = _send_local_file(target_bot.send_video, caption=caption or None)
+        if sent is not None:
+            return sent
+        if file_id:
+            return target_bot.send_video(chat_id, file_id, caption=caption or None)
+        return target_bot.send_message(chat_id, caption or "")
     if content_type == "document":
-        return target_bot.send_document(chat_id, file_id, caption=caption or None)
+        sent = _send_local_file(target_bot.send_document, caption=caption or None)
+        if sent is not None:
+            return sent
+        if file_id:
+            return target_bot.send_document(chat_id, file_id, caption=caption or None)
+        return target_bot.send_message(chat_id, caption or "")
     if content_type == "audio":
-        return target_bot.send_audio(chat_id, file_id, caption=caption or None)
+        sent = _send_local_file(target_bot.send_audio, caption=caption or None)
+        if sent is not None:
+            return sent
+        if file_id:
+            return target_bot.send_audio(chat_id, file_id, caption=caption or None)
+        return target_bot.send_message(chat_id, caption or "")
     if content_type == "voice":
-        return target_bot.send_voice(chat_id, file_id, caption=caption or None)
+        sent = _send_local_file(target_bot.send_voice, caption=caption or None)
+        if sent is not None:
+            return sent
+        if file_id:
+            return target_bot.send_voice(chat_id, file_id, caption=caption or None)
+        return target_bot.send_message(chat_id, caption or "")
     if content_type == "animation":
-        return target_bot.send_animation(chat_id, file_id, caption=caption or None)
+        sent = _send_local_file(target_bot.send_animation, caption=caption or None)
+        if sent is not None:
+            return sent
+        if file_id:
+            return target_bot.send_animation(chat_id, file_id, caption=caption or None)
+        return target_bot.send_message(chat_id, caption or "")
+    if content_type == "video_note":
+        sent = _send_local_file(target_bot.send_video_note)
+        if sent is not None:
+            return sent
+        if file_id:
+            return target_bot.send_video_note(chat_id, file_id)
+        return target_bot.send_message(chat_id, "🎥 Video note")
     if content_type == "sticker":
-        return target_bot.send_sticker(chat_id, file_id)
+        sent = _send_local_file(target_bot.send_sticker)
+        if sent is not None:
+            return sent
+        if file_id:
+            return target_bot.send_sticker(chat_id, file_id)
+        return target_bot.send_message(chat_id, "🙂 Sticker")
+    if content_type == "contact":
+        contact = payload.get("contact")
+        if contact is not None:
+            return target_bot.send_contact(
+                chat_id,
+                phone_number=getattr(contact, "phone_number", ""),
+                first_name=getattr(contact, "first_name", "Contact"),
+                last_name=getattr(contact, "last_name", None),
+                vcard=getattr(contact, "vcard", None),
+            )
+    if content_type == "location":
+        location = payload.get("location")
+        if location is not None:
+            return target_bot.send_location(
+                chat_id,
+                latitude=getattr(location, "latitude", 0.0),
+                longitude=getattr(location, "longitude", 0.0),
+            )
+    if content_type == "venue":
+        venue = payload.get("venue")
+        if venue is not None:
+            venue_location = getattr(venue, "location", None)
+            return target_bot.send_venue(
+                chat_id,
+                latitude=venue_location.latitude if venue_location else 0.0,
+                longitude=venue_location.longitude if venue_location else 0.0,
+                title=getattr(venue, "title", "Venue"),
+                address=getattr(venue, "address", ""),
+                foursquare_id=getattr(venue, "foursquare_id", None),
+                foursquare_type=getattr(venue, "foursquare_type", None),
+            )
+    if content_type == "dice":
+        dice = payload.get("dice")
+        if dice is not None:
+            return target_bot.send_dice(chat_id, emoji=getattr(dice, "emoji", None) or "🎲")
+    if content_type == "poll":
+        poll = payload.get("poll")
+        question = getattr(poll, "question", None) if poll is not None else None
+        options = []
+        if poll is not None:
+            for opt in getattr(poll, "options", []) or []:
+                options.append(getattr(opt, "text", str(opt)))
+        if question and options:
+            try:
+                return target_bot.send_poll(
+                    chat_id,
+                    question,
+                    options,
+                    is_anonymous=getattr(poll, "is_anonymous", True),
+                    type=getattr(poll, "type", "regular"),
+                    allows_multiple_answers=getattr(poll, "allows_multiple_answers", False),
+                )
+            except Exception:
+                pass
+        return target_bot.send_message(chat_id, question or payload.get("text") or caption or "Poll")
 
     # Safe fallback: try plain text if available.
     text = payload.get("text") or caption or ""
@@ -510,70 +771,77 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
     else:
         target = get_group_by_chat_id(int(target_group_id))
         groups = [target] if target else []
-    managed_bots = get_managed_bot_instances()
 
     repeats = max(1, int(repeats or 1))
     delay_seconds = max(0, int(delay_seconds or 0))
 
-    if not groups or not managed_bots:
-        return len(groups) * len(managed_bots) * repeats, 0, len(groups) * len(managed_bots) * repeats
+    if not groups:
+        return 0, 0, 0
 
-    total = len(groups) * len(managed_bots) * repeats
+    workers = get_broadcast_worker_bots()
+    if not workers:
+        return 0, 0, 0
+
+    payload = _prepare_broadcast_media(dict(payload))
+
+    total = len(groups) * repeats
     sent = 0
     failed = 0
 
-    def _broadcast_one(target_bot, bot_row, chat_id: int):
-        nonlocal sent, failed
+    def _broadcast_one(group_index: int, chat_id: int):
         last_exc = None
-        for attempt in range(4):
-            try:
-                send_payload_with_bot(target_bot, chat_id, payload)
-                return True, None
-            except ApiTelegramException as exc:
-                last_exc = exc
-                log.warning(
-                    "Broadcast failed to %s using %s: %s",
-                    chat_id,
-                    bot_row["id"] if bot_row else "engine",
-                    exc,
-                )
-                time.sleep(0.25 * (attempt + 1))
-            except Exception as exc:
-                last_exc = exc
-                log.warning(
-                    "Broadcast failed to %s using %s: %s",
-                    chat_id,
-                    bot_row["id"] if bot_row else "engine",
-                    exc,
-                )
-                time.sleep(0.25 * (attempt + 1))
+        if not workers:
+            return False, None
+
+        rotation = group_index % len(workers)
+        ordered_workers = workers[rotation:] + workers[:rotation]
+
+        for bot_row, target_bot in ordered_workers:
+            for attempt in range(2):
+                try:
+                    send_payload_with_bot(target_bot, chat_id, payload)
+                    return True, None
+                except ApiTelegramException as exc:
+                    last_exc = exc
+                    err_text = str(exc).lower()
+                    # If this looks temporary, retry once quickly; otherwise move
+                    # on to the next worker bot.
+                    if "retry after" in err_text or "too many requests" in err_text:
+                        time.sleep(0.12 * (attempt + 1))
+                        continue
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    time.sleep(0.05 * (attempt + 1))
+                    break
+
         return False, last_exc
 
-    # A small thread pool gives us much better throughput while keeping the
-    # bot stable on Render Free.
-    max_workers = min(16, max(4, len(managed_bots) * 2))
-    for round_index in range(repeats):
-        futures = []
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for group in groups:
-                chat_id = int(group["chat_id"])
-                for bot_row, target_bot in managed_bots:
-                    futures.append(executor.submit(_broadcast_one, target_bot, bot_row, chat_id))
+    max_workers = min(32, max(8, len(groups)))
 
-            for future in as_completed(futures):
-                ok, _err = future.result()
-                if ok:
-                    sent += 1
-                else:
-                    failed += 1
+    try:
+        for round_index in range(repeats):
+            futures = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for group_index, group in enumerate(groups):
+                    chat_id = int(group["chat_id"])
+                    futures.append(executor.submit(_broadcast_one, group_index + round_index, chat_id))
 
-        if round_index < repeats - 1 and delay_seconds:
-            time.sleep(delay_seconds)
+                for future in as_completed(futures):
+                    ok, _err = future.result()
+                    if ok:
+                        sent += 1
+                    else:
+                        failed += 1
+
+            if round_index < repeats - 1 and delay_seconds:
+                time.sleep(delay_seconds)
+    finally:
+        _cleanup_broadcast_media(payload)
 
     return total, sent, failed
-
 
 def render_group_hint():
 
@@ -745,10 +1013,6 @@ def broadcast_cmd(message):
     if count_groups() <= 0:
         bot.reply_to(message, t(lang, "broadcast_no_groups"))
         return
-    if count_bots() <= 0:
-        bot.reply_to(message, "No follower bots are active yet. Add at least one bot first.")
-        return
-    reset_pending(message.from_user.id)
     set_state(message.from_user.id, "await_broadcast_group")
     show_broadcast_group_prompt(message.chat.id, message.from_user.id)
 
@@ -912,14 +1176,6 @@ def menu_actions(call):
                 call.message.message_id,
             )
             return
-        if count_bots() <= 0:
-            send_or_edit(
-                call.message.chat.id,
-                "No follower bots are active yet. Add at least one bot first.",
-                main_menu_keyboard(call.from_user.id, lang),
-                call.message.message_id,
-            )
-            return
         reset_pending(call.from_user.id)
         set_state(call.from_user.id, "await_broadcast_group")
         show_broadcast_group_prompt(call.message.chat.id, call.from_user.id, message_id=call.message.message_id)
@@ -1055,7 +1311,7 @@ def cancel(call):
     send_or_edit(call.message.chat.id, t(lang, "cancelled"), main_menu_keyboard(call.from_user.id, lang), call.message.message_id)
 
 
-@bot.message_handler(content_types=["text", "photo", "video", "document", "audio", "voice", "sticker", "animation"])
+@bot.message_handler(content_types=SUPPORTED_BROADCAST_CONTENT_TYPES)
 def content_router(message):
     ensure_user(message.from_user.id)
     row = get_user(message.from_user.id)
@@ -1189,7 +1445,7 @@ def content_router(message):
         )
         bot.reply_to(
             message,
-            "📝 Send the message you want to broadcast now.\nIt will be sent by all saved bots to all registered groups.",
+            "📝 Send the message you want to broadcast now.\nIt will be copied exactly and sent faster.",
             reply_markup=cancel_keyboard(lang),
         )
         return
@@ -1205,7 +1461,7 @@ def content_router(message):
                 delay_seconds=delay,
                 target_group_id=int(row["pending_group_id"] or 0) or None,
             )
-            result_text = f"✅ Broadcast finished.\nAttempts: {total}\nSent: {sent}\nFailed: {failed}"
+            result_text = f"✅ Broadcast finished.\nTargets: {total}\nSent: {sent}\nFailed: {failed}"
         except Exception as exc:
             log.exception("Broadcast crashed for user %s", message.from_user.id)
             total = sent = 0
