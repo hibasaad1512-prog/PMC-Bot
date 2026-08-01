@@ -3,6 +3,7 @@ import os
 import re
 import time
 from typing import Optional
+from urllib.parse import urlparse, unquote
 
 from flask import Flask, abort, request
 import telebot
@@ -16,6 +17,7 @@ from database import (
     count_groups,
     count_users,
     delete_bot_record,
+    delete_group_record,
     ensure_user,
     find_groups_by_query,
     get_group_by_chat_id,
@@ -161,6 +163,89 @@ def show_remove_prompt(chat_id: int, user_id: int, page: int = 0, message_id: Op
     send_or_edit(chat_id, text, remove_bots_keyboard(lang, page), message_id)
 
 
+def remove_groups_keyboard(lang: str, page: int = 0):
+    total = count_groups()
+    groups = list_groups(offset=page * MAX_GROUPS_PER_PAGE, limit=MAX_GROUPS_PER_PAGE)
+    kb = InlineKeyboardMarkup()
+
+    if not groups:
+        kb.add(InlineKeyboardButton("↩️ Back", callback_data="menu:home"))
+        return kb
+
+    for group_row in groups:
+        title = (group_row["title"] or "Untitled group").strip()
+        if len(title) > 22:
+            title = title[:19] + "..."
+        chat_id = int(group_row["chat_id"])
+        kb.add(InlineKeyboardButton(f"{title} · {chat_id}", callback_data=f"grm:{page}:{chat_id}"))
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"grm_page:{page-1}"))
+    if (page + 1) * MAX_GROUPS_PER_PAGE < total:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"grm_page:{page+1}"))
+    if nav:
+        kb.row(*nav)
+
+    kb.row(
+        InlineKeyboardButton("↩️ Back", callback_data="menu:home"),
+        InlineKeyboardButton(t(lang, "cancel"), callback_data="cancel"),
+    )
+    return kb
+
+
+def show_remove_group_prompt(chat_id: int, user_id: int, page: int = 0, message_id: Optional[int] = None):
+    lang = current_lang(user_id)
+    total = count_groups()
+    if total <= 0:
+        send_or_edit(chat_id, t(lang, "broadcast_no_groups"), main_menu_keyboard(user_id, lang), message_id)
+        return
+
+    max_page = max(0, (total - 1) // MAX_GROUPS_PER_PAGE)
+    page = max(0, min(page, max_page))
+    text = f"🗑️ Remove a group\n\nSelect a saved group to delete it from the list."
+    send_or_edit(chat_id, text, remove_groups_keyboard(lang, page), message_id)
+
+
+def normalize_group_reference(raw_text: str) -> str:
+    raw = (raw_text or "").strip()
+    if not raw:
+        return ""
+
+    # If user pasted a t.me link, keep only the username/path.
+    if raw.startswith("http://") or raw.startswith("https://"):
+        parsed = urlparse(raw)
+        raw = (parsed.path or "").strip("/")
+    elif raw.startswith("t.me/") or raw.startswith("telegram.me/"):
+        raw = raw.split("/", 1)[1].strip()
+
+    raw = raw.strip()
+    raw = raw.split("?", 1)[0].split("#", 1)[0].strip()
+
+    if raw.startswith("@") and len(raw) > 1:
+        return raw
+    if raw.startswith("+" ) or raw.lower().startswith("joinchat/"):
+        return raw
+    if raw.lstrip("-").isdigit():
+        return raw
+    # Convert plain username to @username.
+    if raw:
+        return f"@{raw}"
+    return ""
+
+
+def _extract_forwarded_chat(message):
+    forward_chat = getattr(message, "forward_from_chat", None)
+    if forward_chat is not None:
+        return forward_chat
+    forward_origin = getattr(message, "forward_origin", None)
+    if forward_origin is not None:
+        origin_chat = getattr(forward_origin, "chat", None) or getattr(forward_origin, "sender_chat", None)
+        if origin_chat is not None:
+            return origin_chat
+    return None
+
+
 def validate_bot_token(token: str) -> bool:
     token = token.strip()
     if not BOT_TOKEN_RE.fullmatch(token):
@@ -194,11 +279,15 @@ def register_group_from_message(message):
 
 
 def resolve_group_from_private_message(message):
-    forward_chat = getattr(message, "forward_from_chat", None)
+    forward_chat = _extract_forwarded_chat(message)
     if forward_chat is not None:
         return forward_chat, None
 
     raw_text = (getattr(message, "text", None) or "").strip()
+    if not raw_text:
+        return None, "empty"
+
+    raw_text = normalize_group_reference(raw_text)
     if not raw_text:
         return None, "empty"
 
@@ -232,14 +321,16 @@ def resolve_group_from_private_message(message):
         pass
 
     # Search previously registered groups by title/username.
-    matches = find_groups_by_query(raw_text)
+    matches = find_groups_by_query(raw_text.lstrip("@"))
     if len(matches) == 1:
         row = matches[0]
+
         class _Chat:
             id = int(row["chat_id"])
             title = row["title"]
             username = row["username"]
             type = row["chat_type"] or "group"
+
         return _Chat(), None
 
     if len(matches) > 1:
@@ -249,6 +340,7 @@ def resolve_group_from_private_message(message):
 
 
 def get_managed_bot_instances():
+
     bots = []
     for row in list_all_bots():
         token = (row["token"] or "").strip()
@@ -330,7 +422,7 @@ def broadcast_message_to_groups(source_chat_id: int, source_message_id: int, rep
 
 def render_group_hint():
     return (
-        "Send a forwarded message from the target group, or send its @username, or send its numeric chat ID.\n"
+        "Send a forwarded message from the target group, or send its @username, a t.me link, or numeric chat ID.\n"
         "You can also type a previously saved group name."
     )
 
@@ -455,6 +547,15 @@ def removebot_cmd(message):
     show_remove_prompt(message.chat.id, message.from_user.id, page=0)
 
 
+@bot.message_handler(commands=["removegroup"])
+def removegroup_cmd(message):
+    ensure_user(message.from_user.id)
+    if not require_admin(message):
+        return
+    reset_pending(message.from_user.id)
+    show_remove_group_prompt(message.chat.id, message.from_user.id, page=0)
+
+
 @bot.message_handler(commands=["broadcast"])
 def broadcast_cmd(message):
     ensure_user(message.from_user.id)
@@ -507,7 +608,7 @@ def register_cmd(message):
             else:
                 bot.reply_to(
                     message,
-                    "I could not resolve that group. Send a forwarded message from the group, its @username, or its numeric chat ID.",
+                    "I could not resolve that group. Send a forwarded message from the group, its @username, a t.me link, or its numeric chat ID.",
                 )
             return
 
@@ -522,7 +623,7 @@ def register_cmd(message):
     set_state(message.from_user.id, "await_register_target")
     bot.reply_to(
         message,
-        "Send a forwarded message from the target group, or send its @username, or send its numeric chat ID.\nYou can also type a previously saved group name.",
+        render_group_hint(),
         reply_markup=cancel_keyboard(lang),
     )
 
@@ -670,6 +771,41 @@ def remove_bot(call):
     show_remove_prompt(call.message.chat.id, call.from_user.id, page=page, message_id=call.message.message_id)
 
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith("grm_page:"))
+def paginate_remove_groups(call):
+    ensure_user(call.from_user.id)
+    if not require_admin(call.message):
+        return
+    try:
+        page = max(0, int(call.data.split(":", 1)[1]))
+    except Exception:
+        page = 0
+    bot.answer_callback_query(call.id)
+    show_remove_group_prompt(call.message.chat.id, call.from_user.id, page=page, message_id=call.message.message_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("grm:"))
+def remove_group(call):
+    ensure_user(call.from_user.id)
+    if not require_admin(call.message):
+        return
+    parts = call.data.split(":")
+    if len(parts) != 3:
+        bot.answer_callback_query(call.id)
+        return
+
+    try:
+        page = max(0, int(parts[1]))
+        chat_id = int(parts[2])
+    except Exception:
+        bot.answer_callback_query(call.id)
+        return
+
+    ok = delete_group_record(chat_id)
+    bot.answer_callback_query(call.id, "Group removed successfully." if ok else "Could not remove that group.", show_alert=not ok)
+    show_remove_group_prompt(call.message.chat.id, call.from_user.id, page=page, message_id=call.message.message_id)
+
+
 @bot.callback_query_handler(func=lambda call: call.data == "cancel")
 def cancel(call):
     ensure_user(call.from_user.id)
@@ -734,7 +870,7 @@ def content_router(message):
             else:
                 bot.reply_to(
                     message,
-                    "I could not resolve that group. Send a forwarded message from the group, its @username, or its numeric chat ID.",
+                    "I could not resolve that group. Send a forwarded message from the group, its @username, a t.me link, or its numeric chat ID.",
                     reply_markup=cancel_keyboard(lang),
                 )
             return

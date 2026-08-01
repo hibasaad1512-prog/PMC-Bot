@@ -189,6 +189,16 @@ def deactivate_group(chat_id: int):
     return updated > 0
 
 
+def delete_group_record(chat_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM groups WHERE chat_id=?", (chat_id,))
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    return deleted > 0
+
+
 def count_users() -> int:
     conn = get_connection()
     cur = conn.cursor()
