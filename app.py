@@ -2,7 +2,6 @@ import logging
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 from urllib.parse import urlparse, unquote
 
@@ -17,7 +16,6 @@ from database import (
     count_bots,
     count_groups,
     count_users,
-    deactivate_group,
     delete_bot_record,
     delete_group_record,
     ensure_user,
@@ -48,8 +46,6 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=False)
 BOT_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
 
 BOT_ID: int | None = None
-BROADCAST_MAX_WORKERS = max(4, int(os.getenv("BROADCAST_MAX_WORKERS", "32")))
-BROADCAST_RETRY_SLEEP = float(os.getenv("BROADCAST_RETRY_SLEEP", "0.12"))
 
 
 def _get_attr_or_key(obj, name, default=None):
@@ -217,52 +213,6 @@ def show_remove_group_prompt(chat_id: int, user_id: int, page: int = 0, message_
     page = max(0, min(page, max_page))
     text = f"🗑️ Remove a group\n\nSelect a saved group to delete it from the list."
     send_or_edit(chat_id, text, remove_groups_keyboard(lang, page), message_id)
-
-
-def broadcast_groups_keyboard(lang: str, page: int = 0):
-    total = count_groups()
-    groups = list_groups(offset=page * MAX_GROUPS_PER_PAGE, limit=MAX_GROUPS_PER_PAGE)
-    kb = InlineKeyboardMarkup()
-
-    if not groups:
-        kb.add(InlineKeyboardButton("↩️ Back", callback_data="menu:home"))
-        return kb
-
-    for group_row in groups:
-        title = (group_row["title"] or "Untitled group").strip()
-        if len(title) > 22:
-            title = title[:19] + "..."
-        chat_id = int(group_row["chat_id"])
-        username = (group_row["username"] or "").strip()
-        suffix = f" @{username.lstrip('@')}" if username else ""
-        kb.add(InlineKeyboardButton(f"{title}{suffix}", callback_data=f"bg:{page}:{chat_id}"))
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("◀️", callback_data=f"bg_page:{page-1}"))
-    if (page + 1) * MAX_GROUPS_PER_PAGE < total:
-        nav.append(InlineKeyboardButton("▶️", callback_data=f"bg_page:{page+1}"))
-    if nav:
-        kb.row(*nav)
-
-    kb.row(
-        InlineKeyboardButton("↩️ Back", callback_data="menu:home"),
-        InlineKeyboardButton(t(lang, "cancel"), callback_data="cancel"),
-    )
-    return kb
-
-
-def show_broadcast_group_prompt(chat_id: int, user_id: int, page: int = 0, message_id: Optional[int] = None):
-    lang = current_lang(user_id)
-    total = count_groups()
-    if total <= 0:
-        send_or_edit(chat_id, t(lang, "broadcast_no_groups"), main_menu_keyboard(user_id, lang), message_id)
-        return
-
-    max_page = max(0, (total - 1) // MAX_GROUPS_PER_PAGE)
-    page = max(0, min(page, max_page))
-    text = f"{t(lang, 'choose_group')}\n\n{t(lang, 'select_broadcast_group')}"
-    send_or_edit(chat_id, text, broadcast_groups_keyboard(lang, page), message_id)
 
 
 def normalize_group_reference(raw_text: str) -> str:
@@ -436,29 +386,10 @@ def _copy_or_forward_message(target_bot, chat_id: int, source_chat_id: int, sour
     target_bot.forward_message(chat_id=chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
 
 
-
-def _clean_kwargs(kwargs: dict):
-    return {key: value for key, value in kwargs.items() if value is not None}
-
-
-def _should_retry_api_exception(exc: Exception) -> bool:
-    code = getattr(exc, "error_code", None)
-    if code in (400, 401, 403, 404):
-        return False
-    if code == 429:
-        return True
-    description = str(exc).lower()
-    if "forbidden" in description or "bad request" in description:
-        return False
-    return True
-
-
-
 def extract_broadcast_payload(message):
     """
     Capture the incoming message in a bot-agnostic structure so follower bots
     can send it themselves, without needing access to the engine's private chat.
-    Supports the most common Telegram message types, including media and rich content.
     """
     content_type = getattr(message, "content_type", None) or (
         "text" if getattr(message, "text", None) else "unknown"
@@ -469,33 +400,6 @@ def extract_broadcast_payload(message):
         "text": None,
         "file_id": None,
         "caption": None,
-        "phone_number": None,
-        "first_name": None,
-        "last_name": None,
-        "vcard": None,
-        "latitude": None,
-        "longitude": None,
-        "live_period": None,
-        "horizontal_accuracy": None,
-        "heading": None,
-        "proximity_alert_radius": None,
-        "title": None,
-        "address": None,
-        "foursquare_id": None,
-        "foursquare_type": None,
-        "google_place_id": None,
-        "google_place_type": None,
-        "question": None,
-        "options": None,
-        "is_anonymous": None,
-        "poll_type": None,
-        "allows_multiple_answers": None,
-        "correct_option_id": None,
-        "explanation": None,
-        "open_period": None,
-        "close_date": None,
-        "is_closed": None,
-        "emoji": None,
     }
 
     if content_type == "text":
@@ -509,73 +413,18 @@ def extract_broadcast_payload(message):
         payload["caption"] = getattr(message, "caption", None)
         return payload
 
-    if content_type in {"video", "document", "audio", "voice", "animation", "sticker", "video_note"}:
+    if content_type in {"video", "document", "audio", "voice", "animation", "sticker"}:
         obj = getattr(message, content_type, None)
         if obj is not None:
             payload["file_id"] = getattr(obj, "file_id", None)
-        if content_type not in {"sticker", "video_note"}:
+        if content_type != "sticker":
             payload["caption"] = getattr(message, "caption", None)
         return payload
 
-    if content_type == "contact":
-        contact = getattr(message, "contact", None)
-        if contact is not None:
-            payload["phone_number"] = getattr(contact, "phone_number", None)
-            payload["first_name"] = getattr(contact, "first_name", None)
-            payload["last_name"] = getattr(contact, "last_name", None)
-            payload["vcard"] = getattr(contact, "vcard", None)
-        return payload
-
-    if content_type == "location":
-        location = getattr(message, "location", None)
-        if location is not None:
-            payload["latitude"] = getattr(location, "latitude", None)
-            payload["longitude"] = getattr(location, "longitude", None)
-            payload["live_period"] = getattr(location, "live_period", None)
-            payload["horizontal_accuracy"] = getattr(location, "horizontal_accuracy", None)
-            payload["heading"] = getattr(location, "heading", None)
-            payload["proximity_alert_radius"] = getattr(location, "proximity_alert_radius", None)
-        return payload
-
-    if content_type == "venue":
-        venue = getattr(message, "venue", None)
-        if venue is not None:
-            payload["latitude"] = getattr(venue, "location", None).latitude if getattr(venue, "location", None) else None
-            payload["longitude"] = getattr(venue, "location", None).longitude if getattr(venue, "location", None) else None
-            payload["title"] = getattr(venue, "title", None)
-            payload["address"] = getattr(venue, "address", None)
-            payload["foursquare_id"] = getattr(venue, "foursquare_id", None)
-            payload["foursquare_type"] = getattr(venue, "foursquare_type", None)
-            payload["google_place_id"] = getattr(venue, "google_place_id", None)
-            payload["google_place_type"] = getattr(venue, "google_place_type", None)
-        return payload
-
-    if content_type == "poll":
-        poll = getattr(message, "poll", None)
-        if poll is not None:
-            payload["question"] = getattr(poll, "question", None)
-            payload["options"] = [getattr(opt, "text", str(opt)) for opt in (getattr(poll, "options", None) or [])]
-            payload["is_anonymous"] = getattr(poll, "is_anonymous", None)
-            payload["poll_type"] = getattr(poll, "type", None)
-            payload["allows_multiple_answers"] = getattr(poll, "allows_multiple_answers", None)
-            payload["correct_option_id"] = getattr(poll, "correct_option_id", None)
-            payload["explanation"] = getattr(poll, "explanation", None)
-            payload["open_period"] = getattr(poll, "open_period", None)
-            payload["close_date"] = getattr(poll, "close_date", None)
-            payload["is_closed"] = getattr(poll, "is_closed", None)
-        return payload
-
-    if content_type == "dice":
-        dice = getattr(message, "dice", None)
-        if dice is not None:
-            payload["emoji"] = getattr(dice, "emoji", None)
-        return payload
-
-    # Fallback for unsupported types; we'll try to use text if present.
+    # Fallback for any unsupported type; we'll try to use text if present.
     payload["text"] = getattr(message, "text", None)
     payload["caption"] = getattr(message, "caption", None)
     return payload
-
 
 
 def send_payload_with_bot(target_bot, chat_id: int, payload: dict):
@@ -602,92 +451,21 @@ def send_payload_with_bot(target_bot, chat_id: int, payload: dict):
         return target_bot.send_animation(chat_id, file_id, caption=caption or None)
     if content_type == "sticker":
         return target_bot.send_sticker(chat_id, file_id)
-    if content_type == "video_note":
-        return target_bot.send_video_note(chat_id, file_id)
-
-    if content_type == "contact":
-        kwargs = _clean_kwargs(
-            {
-                "phone_number": payload.get("phone_number"),
-                "first_name": payload.get("first_name"),
-                "last_name": payload.get("last_name"),
-                "vcard": payload.get("vcard"),
-            }
-        )
-        return target_bot.send_contact(chat_id, **kwargs)
-
-    if content_type == "location":
-        kwargs = _clean_kwargs(
-            {
-                "latitude": payload.get("latitude"),
-                "longitude": payload.get("longitude"),
-                "live_period": payload.get("live_period"),
-                "horizontal_accuracy": payload.get("horizontal_accuracy"),
-                "heading": payload.get("heading"),
-                "proximity_alert_radius": payload.get("proximity_alert_radius"),
-            }
-        )
-        return target_bot.send_location(chat_id, **kwargs)
-
-    if content_type == "venue":
-        kwargs = _clean_kwargs(
-            {
-                "latitude": payload.get("latitude"),
-                "longitude": payload.get("longitude"),
-                "title": payload.get("title"),
-                "address": payload.get("address"),
-                "foursquare_id": payload.get("foursquare_id"),
-                "foursquare_type": payload.get("foursquare_type"),
-                "google_place_id": payload.get("google_place_id"),
-                "google_place_type": payload.get("google_place_type"),
-            }
-        )
-        return target_bot.send_venue(chat_id, **kwargs)
-
-    if content_type == "poll":
-        options = [opt for opt in (payload.get("options") or []) if opt]
-        if not payload.get("question") or len(options) < 2:
-            text = payload.get("text") or caption or "Unsupported poll payload."
-            return target_bot.send_message(chat_id, text)
-
-        kwargs = _clean_kwargs(
-            {
-                "is_anonymous": payload.get("is_anonymous"),
-                "type": payload.get("poll_type"),
-                "allows_multiple_answers": payload.get("allows_multiple_answers"),
-                "correct_option_id": payload.get("correct_option_id"),
-                "explanation": payload.get("explanation"),
-                "open_period": payload.get("open_period"),
-                "close_date": payload.get("close_date"),
-                "is_closed": payload.get("is_closed"),
-            }
-        )
-        return target_bot.send_poll(chat_id, payload["question"], options, **kwargs)
-
-    if content_type == "dice":
-        kwargs = _clean_kwargs({"emoji": payload.get("emoji")})
-        return target_bot.send_dice(chat_id, **kwargs)
 
     # Safe fallback: try plain text if available.
     text = payload.get("text") or caption or ""
     return target_bot.send_message(chat_id, text)
 
 
-
-def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: int = 0, target_group_id: int | None = None):
-    if target_group_id is None:
-        groups = list_groups(limit=10_000)
-    else:
-        target = get_group_by_chat_id(int(target_group_id))
-        groups = [target] if target else []
+def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: int = 0):
+    groups = list_groups(limit=10_000)
     managed_bots = get_managed_bot_instances()
 
     repeats = max(1, int(repeats or 1))
     delay_seconds = max(0, int(delay_seconds or 0))
 
     if not groups or not managed_bots:
-        total = len(groups) * len(managed_bots) * repeats
-        return total, 0, total
+        return len(groups) * len(managed_bots) * repeats, 0, len(groups) * len(managed_bots) * repeats
 
     total = len(groups) * len(managed_bots) * repeats
     sent = 0
@@ -702,24 +480,13 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
                 return True, None
             except ApiTelegramException as exc:
                 last_exc = exc
-                error_code = getattr(exc, "error_code", None)
-                description = str(exc).lower()
-                # Fail fast for permanent errors.
-                if error_code in (400, 401, 403, 404) or "forbidden" in description or "bad request" in description:
-                    log.warning(
-                        "Permanent broadcast failure to %s using bot %s: %s",
-                        chat_id,
-                        bot_row["id"] if bot_row else "engine",
-                        exc,
-                    )
-                    return False, last_exc
                 log.warning(
-                    "Temporary broadcast failure to %s using bot %s: %s",
+                    "Broadcast failed to %s using %s: %s",
                     chat_id,
                     bot_row["id"] if bot_row else "engine",
                     exc,
                 )
-                time.sleep(BROADCAST_RETRY_SLEEP * (attempt + 1))
+                time.sleep(0.25 * (attempt + 1))
             except Exception as exc:
                 last_exc = exc
                 log.warning(
@@ -728,37 +495,31 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
                     bot_row["id"] if bot_row else "engine",
                     exc,
                 )
-                time.sleep(BROADCAST_RETRY_SLEEP * (attempt + 1))
+                time.sleep(0.25 * (attempt + 1))
         return False, last_exc
 
-    def _run_bot_worker(bot_row, target_bot):
-        local_sent = 0
-        local_failed = 0
-        for round_index in range(repeats):
+    # A small thread pool gives us much better throughput while keeping the
+    # bot stable on Render Free.
+    max_workers = min(16, max(4, len(managed_bots) * 2))
+    for round_index in range(repeats):
+        futures = []
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for group in groups:
                 chat_id = int(group["chat_id"])
-                ok, _err = _broadcast_one(target_bot, bot_row, chat_id)
+                for bot_row, target_bot in managed_bots:
+                    futures.append(executor.submit(_broadcast_one, target_bot, bot_row, chat_id))
+
+            for future in as_completed(futures):
+                ok, _err = future.result()
                 if ok:
-                    local_sent += 1
+                    sent += 1
                 else:
-                    local_failed += 1
-            if round_index < repeats - 1 and delay_seconds:
-                time.sleep(delay_seconds)
-        return local_sent, local_failed
+                    failed += 1
 
-    # Parallelize by bot (not by every bot/group pair). This is usually faster,
-    # lowers pressure on Telegram rate limits, and keeps all follower bots working
-    # at the same time.
-    max_workers = min(BROADCAST_MAX_WORKERS, max(1, len(managed_bots)))
-
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_run_bot_worker, bot_row, target_bot) for bot_row, target_bot in managed_bots]
-        for future in as_completed(futures):
-            local_sent, local_failed = future.result()
-            sent += local_sent
-            failed += local_failed
+        if round_index < repeats - 1 and delay_seconds:
+            time.sleep(delay_seconds)
 
     return total, sent, failed
 
@@ -937,8 +698,12 @@ def broadcast_cmd(message):
         bot.reply_to(message, "No follower bots are active yet. Add at least one bot first.")
         return
     reset_pending(message.from_user.id)
-    set_state(message.from_user.id, "await_broadcast_group")
-    show_broadcast_group_prompt(message.chat.id, message.from_user.id)
+    set_state(message.from_user.id, "await_broadcast_repeats")
+    bot.reply_to(
+        message,
+        "🔁 How many times should this message be sent?\n\nSend a number like 1, 2, 5...",
+        reply_markup=cancel_keyboard(lang),
+    )
 
 
 @bot.message_handler(commands=["register"])
@@ -1011,19 +776,6 @@ def on_new_chat_members(message):
             bot.reply_to(message, t(current_lang(message.from_user.id), "group_registered_auto"))
     except Exception as exc:
         log.warning("Failed to register new group: %s", exc)
-
-
-@bot.message_handler(content_types=["left_chat_member"])
-def on_left_chat_member(message):
-    ensure_user(message.from_user.id)
-    if BOT_ID is None:
-        return
-    try:
-        left = getattr(message, "left_chat_member", None)
-        if left is not None and getattr(left, "id", None) == BOT_ID:
-            deactivate_group(int(message.chat.id))
-    except Exception as exc:
-        log.warning("Failed to deactivate left group: %s", exc)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("lang:"))
@@ -1109,8 +861,13 @@ def menu_actions(call):
             )
             return
         reset_pending(call.from_user.id)
-        set_state(call.from_user.id, "await_broadcast_group")
-        show_broadcast_group_prompt(call.message.chat.id, call.from_user.id, message_id=call.message.message_id)
+        set_state(call.from_user.id, "await_broadcast_repeats")
+        send_or_edit(
+            call.message.chat.id,
+            "🔁 How many times should this message be sent?\n\nSend a number like 1, 2, 5...",
+            cancel_keyboard(lang),
+            call.message.message_id,
+        )
     elif action == "home":
         show_main_menu(call.message.chat.id, call.from_user.id, message_id=call.message.message_id)
 
@@ -1184,54 +941,6 @@ def remove_group(call):
     ok = delete_group_record(chat_id)
     bot.answer_callback_query(call.id, "Group removed successfully." if ok else "Could not remove that group.", show_alert=not ok)
     show_remove_group_prompt(call.message.chat.id, call.from_user.id, page=page, message_id=call.message.message_id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("bg_page:"))
-def paginate_broadcast_groups(call):
-    ensure_user(call.from_user.id)
-    if not require_admin(call.message):
-        return
-    try:
-        page = max(0, int(call.data.split(":", 1)[1]))
-    except Exception:
-        page = 0
-    bot.answer_callback_query(call.id)
-    show_broadcast_group_prompt(call.message.chat.id, call.from_user.id, page=page, message_id=call.message.message_id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("bg:"))
-def choose_broadcast_group(call):
-    ensure_user(call.from_user.id)
-    if not require_admin(call.message):
-        return
-    lang = current_lang(call.from_user.id)
-    parts = call.data.split(":")
-    if len(parts) != 3:
-        bot.answer_callback_query(call.id)
-        return
-
-    try:
-        page = max(0, int(parts[1]))
-        chat_id = int(parts[2])
-    except Exception:
-        bot.answer_callback_query(call.id)
-        return
-
-    group = get_group_by_chat_id(chat_id)
-    if not group:
-        bot.answer_callback_query(call.id, "That group is no longer saved.", show_alert=True)
-        show_broadcast_group_prompt(call.message.chat.id, call.from_user.id, page=page, message_id=call.message.message_id)
-        return
-
-    title = (group["title"] or group["username"] or f"Group {chat_id}").strip()
-    set_pending(call.from_user.id, pending_group_id=chat_id, state="await_broadcast_repeats")
-    bot.answer_callback_query(call.id, f"Selected: {title}")
-    send_or_edit(
-        call.message.chat.id,
-        f"✅ Group selected: {title}\n\n🔁 How many times should this message be sent?\nSend a number like 1, 2, 5...",
-        cancel_keyboard(lang),
-        call.message.message_id,
-    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "cancel")
@@ -1320,32 +1029,6 @@ def content_router(message):
         )
         return
 
-    if state == "await_broadcast_group":
-        chat, error = resolve_group_from_private_message(message)
-        if chat is None:
-            if error == "ambiguous":
-                bot.reply_to(
-                    message,
-                    "I found more than one matching group name. Please send the exact @username or numeric chat ID, or choose a group from the buttons below.",
-                    reply_markup=cancel_keyboard(lang),
-                )
-            else:
-                bot.reply_to(
-                    message,
-                    "I could not resolve that group. Send a forwarded message from the group, its @username, a t.me link, or its numeric chat ID.",
-                    reply_markup=cancel_keyboard(lang),
-                )
-            return
-
-        register_group_from_chat(chat)
-        set_pending(message.from_user.id, pending_group_id=int(chat.id), state="await_broadcast_repeats")
-        bot.reply_to(
-            message,
-            f"✅ Group selected: {getattr(chat, 'title', None) or getattr(chat, 'username', None) or chat.id}\n\n🔁 How many times should this message be sent?\nSend a number like 1, 2, 5...",
-            reply_markup=cancel_keyboard(lang),
-        )
-        return
-
     if state == "await_broadcast_repeats":
         raw = (message.text or "").strip()
         if not raw.isdigit() or int(raw) <= 0:
@@ -1377,7 +1060,7 @@ def content_router(message):
         )
         bot.reply_to(
             message,
-            "📝 Send the message you want to broadcast now.\nIt will be sent by all saved bots to all registered groups.\n\nSupported: text, photo, video, GIF, document, sticker, voice, audio, video note, contact, location, venue, poll, and dice.",
+            "📝 Send the message you want to broadcast now.\nIt will be sent by all saved bots to all registered groups.",
             reply_markup=cancel_keyboard(lang),
         )
         return
@@ -1391,7 +1074,6 @@ def content_router(message):
                 payload,
                 repeats=repeats,
                 delay_seconds=delay,
-                target_group_id=int(row["pending_group_id"] or 0) or None,
             )
             result_text = f"✅ Broadcast finished.\nAttempts: {total}\nSent: {sent}\nFailed: {failed}"
         except Exception as exc:

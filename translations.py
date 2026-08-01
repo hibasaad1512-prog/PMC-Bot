@@ -19,7 +19,7 @@ LANGS = {
         "language_saved": "✅ Language saved successfully.",
         "already_set": "✅ Language already selected. You can change it here anytime.",
         "choose_group": "📂 Select a group.",
-        "send_message": "📝 Send any message you want to broadcast.\n\nSupported: text, photos, videos, GIFs, documents, stickers, voice, audio, video notes, contacts, locations, venues, polls, and dice.",
+        "send_message": "📝 Send any message you want to broadcast.\n\nSupported: text, photos, videos, GIFs, documents, stickers, voice, audio.",
         "choose_repeats": "🔁 How many times should this message be sent?",
         "choose_delay": "⏱️ Select the delay between each send.",
         "enter_repeat_number": "✍️ Send a custom repeat count.",
@@ -53,10 +53,9 @@ LANGS = {
         "stats_bots": "Saved bots",
         "stats_groups": "Registered groups",
         "stats_users": "Users",
-        "broadcast_prompt": "Send the message you want to copy to all registered groups. Supported: text, photos, videos, GIFs, documents, stickers, voice, audio, video notes, contacts, locations, venues, polls, and dice.",
+        "broadcast_prompt": "Send the message you want to copy to all registered groups.",
         "broadcast_done": "✅ Broadcast finished.\nSent: {sent}\nFailed: {failed}",
         "broadcast_no_groups": "No groups are registered yet.",
-        "select_broadcast_group": "Select the group you want to use for this broadcast.",
         "group_registered_auto": "✅ This group has been registered automatically.",
     },
     "he": {
@@ -116,7 +115,6 @@ LANGS = {
         "broadcast_prompt": "שלחו את ההודעה שתרצו להעתיק לכל הקבוצות הרשומות.",
         "broadcast_done": "✅ השידור הסתיים.\nנשלח: {sent}\nנכשל: {failed}",
         "broadcast_no_groups": "עדיין לא נרשמו קבוצות.",
-        "select_broadcast_group": "בחרו את הקבוצה שתרצו להשתמש בה לשידור הזה.",
         "group_registered_auto": "✅ הקבוצה הזו נרשמה אוטומטית.",
     },
     "sr": {
@@ -176,7 +174,6 @@ LANGS = {
         "broadcast_prompt": "Pošaljite poruku koju želite da kopirate u sve registrovane grupe.",
         "broadcast_done": "✅ Objavljivanje završeno.\nPoslato: {sent}\nNeuspešno: {failed}",
         "broadcast_no_groups": "Još nema registrovanih grupa.",
-        "select_broadcast_group": "Izaberite grupu koju želite da koristite za ovu objavu.",
         "group_registered_auto": "✅ Ova grupa je automatski registrovana.",
     },
 }
