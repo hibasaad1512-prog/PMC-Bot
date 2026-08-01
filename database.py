@@ -239,3 +239,42 @@ def count_bots() -> int:
     value = cur.fetchone()["c"]
     conn.close()
     return int(value)
+
+
+def get_bot_by_id(bot_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, label, token, added_by, is_active, created_at, updated_at
+        FROM bots
+        WHERE id=?
+        """,
+        (bot_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def delete_bot_record(bot_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM bots WHERE id=?", (bot_id,))
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    return deleted > 0
+
+
+def deactivate_bot_record(bot_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE bots SET is_active=0, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (bot_id,),
+    )
+    conn.commit()
+    updated = cur.rowcount
+    conn.close()
+    return updated > 0
