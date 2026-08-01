@@ -21,8 +21,7 @@ A Telegram broadcast bot built with Flask + SQLite + webhooks for Render.
    - `BOT_TOKEN`
    - `WEBHOOK_URL`
 
-3. The webhook secret is already set to:
-   - `pmc_secret`
+3. Deploy the service.
 
 4. Add the bot to each group and send:
    ```text
@@ -30,7 +29,12 @@ A Telegram broadcast bot built with Flask + SQLite + webhooks for Render.
    ```
    inside that group so it appears in the admin picker.
 
-5. Deploy the service and then send `/start` to the bot.
+5. Open the bot in Telegram and send `/start`.
+
+## Webhook
+- The app automatically sets the webhook to:
+  `https://YOUR-RENDER-URL/webhook`
+- Any path under `/webhook/...` is accepted, so you do not need to manage a secret path manually.
 
 ## Notes
 - The hidden command only shows groups where you are an admin.
