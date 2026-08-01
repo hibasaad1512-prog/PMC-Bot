@@ -28,6 +28,11 @@ LANGS = {
         "broadcast_finished": "✅ Done: {sent}/{total} sent, {failed} failed.",
         "not_admin": "⛔ You must be an admin of the selected group.",
         "custom": "✍️ Custom",
+        "text_required": "Please send text only.",
+        "enter_bot_label": "📛 Send a label/name for this bot.",
+        "enter_bot_token": "🔑 Now send the bot token.",
+        "invalid_bot_token": "⚠️ That does not look like a valid Telegram bot token.",
+        "bot_saved": "✅ Bot stored successfully: {label}",
     },
     "he": {
         "welcome": "🤖 ברוכים הבאים ל-PMC Bot\n\nנא לבחור שפה.",
@@ -58,6 +63,11 @@ LANGS = {
         "broadcast_finished": "✅ הושלם: {sent}/{total} נשלחו, {failed} נכשלו.",
         "not_admin": "⛔ עליך להיות מנהל בקבוצה שנבחרה.",
         "custom": "✍️ מותאם אישית",
+        "text_required": "נא לשלוח טקסט בלבד.",
+        "enter_bot_label": "📛 שלח שם/תווית עבור הבוט.",
+        "enter_bot_token": "🔑 כעת שלח את טוקן הבוט.",
+        "invalid_bot_token": "⚠️ זה לא נראה כמו טוקן תקין של בוט טלגרם.",
+        "bot_saved": "✅ הבוט נשמר בהצלחה: {label}",
     },
     "sr": {
         "welcome": "🤖 Dobrodošli u PMC Bot\n\nIzaberite jezik.",
@@ -88,6 +98,11 @@ LANGS = {
         "broadcast_finished": "✅ Završeno: poslato {sent}/{total}, neuspešno {failed}.",
         "not_admin": "⛔ Morate biti administrator izabrane grupe.",
         "custom": "✍️ Prilagođeno",
+        "text_required": "Pošaljite samo tekst.",
+        "enter_bot_label": "📛 Pošaljite ime/oznaku za ovaj bot.",
+        "enter_bot_token": "🔑 Sada pošaljite bot token.",
+        "invalid_bot_token": "⚠️ To ne izgleda kao ispravan Telegram bot token.",
+        "bot_saved": "✅ Bot je uspešno sačuvan: {label}",
     },
 }
 

@@ -11,10 +11,13 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import BOT_TOKEN, WEBHOOK_URL, MAX_DELAY_SECONDS, MAX_GROUPS_PER_PAGE, MAX_REPEATS
 from database import (
+    add_bot_record,
     count_groups,
+    count_bots,
     ensure_user,
     get_user,
     init_db,
+    list_bots,
     list_groups,
     reset_pending,
     set_language,
@@ -167,6 +170,13 @@ def normalize_number(text: str, minimum: int, maximum: int) -> int | None:
     if value < minimum:
         return None
     return min(value, maximum)
+
+
+BOT_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
+
+
+def validate_bot_token(token: str) -> bool:
+    return bool(BOT_TOKEN_RE.fullmatch(token.strip()))
 
 
 def broadcast_summary_text(lang: str, group_title: str, repeats: int, delay: int) -> str:
@@ -473,12 +483,57 @@ def catch_broadcast_message(message):
     row = get_user(message.from_user.id)
     if not row or not row["state"]:
         return
-    if row["state"] not in ("await_message", "await_repeats", "await_repeats_text", "await_delay", "await_delay_text"):
+
+    valid_states = (
+        "await_message",
+        "await_repeats",
+        "await_repeats_text",
+        "await_delay",
+        "await_delay_text",
+        "await_bot_label",
+        "await_bot_token",
+    )
+    if row["state"] not in valid_states:
         return
 
     lang = row["language"] or "en"
 
     if getattr(message, "text", None) and message.text.startswith("/"):
+        return
+
+    if row["state"] == "await_bot_label":
+        if not getattr(message, "text", None):
+            bot.reply_to(message, t(lang, "text_required"))
+            return
+
+        label = message.text.strip()
+        if not label:
+            bot.reply_to(message, t(lang, "text_required"))
+            return
+
+        set_pending(
+            message.from_user.id,
+            pending_bot_label=label[:100],
+            pending_bot_token=None,
+            state="await_bot_token",
+        )
+        bot.reply_to(message, t(lang, "enter_bot_token"), reply_markup=cancel_keyboard())
+        return
+
+    if row["state"] == "await_bot_token":
+        if not getattr(message, "text", None):
+            bot.reply_to(message, t(lang, "invalid_bot_token"))
+            return
+
+        token = message.text.strip()
+        if not validate_bot_token(token):
+            bot.reply_to(message, t(lang, "invalid_bot_token"))
+            return
+
+        label = (row["pending_bot_label"] or "Untitled bot").strip()[:100]
+        add_bot_record(label=label, token=token, added_by=message.from_user.id)
+        reset_pending(message.from_user.id)
+        bot.reply_to(message, t(lang, "bot_saved").format(label=label))
         return
 
     if row["state"] == "await_message":
