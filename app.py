@@ -3,6 +3,8 @@ import os
 import re
 import time
 import tempfile
+import threading
+import uuid
 from typing import Optional
 from urllib.parse import urlparse, unquote
 
@@ -48,6 +50,11 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=False)
 BOT_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
 
 BOT_ID: int | None = None
+
+BROADCAST_BATCH_SIZE = 10
+BROADCAST_CHUNK_PAUSE = 0.35
+ACTIVE_BROADCASTS: dict[int, dict] = {}
+ACTIVE_BROADCASTS_LOCK = threading.Lock()
 
 SUPPORTED_BROADCAST_CONTENT_TYPES = [
     "text",
@@ -539,6 +546,99 @@ def _cleanup_broadcast_media(payload: dict):
         payload.pop("local_path", None)
 
 
+def _extract_retry_after_seconds(exc) -> float:
+    text = str(exc)
+    match = re.search(r"retry after\s*(\d+(?:\.\d+)?)", text, flags=re.IGNORECASE)
+    if match:
+        try:
+            return max(0.0, float(match.group(1)))
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def _broadcast_job_key(user_id: int) -> int:
+    return int(user_id)
+
+
+def get_active_broadcast_job(user_id: int):
+    with ACTIVE_BROADCASTS_LOCK:
+        return ACTIVE_BROADCASTS.get(_broadcast_job_key(user_id))
+
+
+def has_active_broadcast(user_id: int) -> bool:
+    return get_active_broadcast_job(user_id) is not None
+
+
+def stop_active_broadcast(user_id: int) -> bool:
+    job = get_active_broadcast_job(user_id)
+    if not job:
+        return False
+    job["stop_event"].set()
+    return True
+
+
+def _clear_active_broadcast(user_id: int, job_id: str | None = None):
+    with ACTIVE_BROADCASTS_LOCK:
+        current = ACTIVE_BROADCASTS.get(_broadcast_job_key(user_id))
+        if not current:
+            return
+        if job_id is not None and current.get("job_id") != job_id:
+            return
+        ACTIVE_BROADCASTS.pop(_broadcast_job_key(user_id), None)
+
+
+def _store_active_broadcast(job: dict):
+    with ACTIVE_BROADCASTS_LOCK:
+        ACTIVE_BROADCASTS[_broadcast_job_key(job["user_id"])] = job
+
+
+def start_background_broadcast(user_id: int, chat_id: int, lang: str, payload: dict, repeats: int, delay_seconds: int, target_group_id: int | None):
+    job_id = uuid.uuid4().hex[:12]
+    stop_event = threading.Event()
+    job = {
+        "job_id": job_id,
+        "user_id": int(user_id),
+        "chat_id": int(chat_id),
+        "lang": lang if lang in ("en", "he", "sr") else "en",
+        "stop_event": stop_event,
+        "started_at": time.time(),
+    }
+    _store_active_broadcast(job)
+
+    def _worker():
+        result_text = None
+        try:
+            total, sent, failed = broadcast_message_to_groups(
+                payload,
+                repeats=repeats,
+                delay_seconds=delay_seconds,
+                target_group_id=target_group_id,
+                stop_event=stop_event,
+                batch_size=BROADCAST_BATCH_SIZE,
+            )
+            if stop_event.is_set():
+                result_text = t(job["lang"], "broadcast_stopped")
+                result_text += f"\nSent: {sent}\nFailed: {failed}"
+            else:
+                result_text = t(job["lang"], "broadcast_done").format(sent=sent, failed=failed)
+        except Exception as exc:
+            log.exception("Background broadcast crashed for user %s", user_id)
+            result_text = f"⚠️ Broadcast failed unexpectedly.\n{exc}"
+        finally:
+            _clear_active_broadcast(user_id, job_id)
+
+        try:
+            bot.send_message(job["chat_id"], result_text, reply_markup=main_menu_keyboard(job["user_id"], job["lang"]))
+        except Exception as exc:
+            log.warning("Could not send broadcast completion notice: %s", exc)
+
+    thread = threading.Thread(target=_worker, name=f"broadcast-{job_id}", daemon=True)
+    job["thread"] = thread
+    thread.start()
+    return job
+
+
 def _bot_name(bot_row):
     if not bot_row:
         return "engine"
@@ -765,7 +865,14 @@ def send_payload_with_bot(target_bot, chat_id: int, payload: dict):
     return target_bot.send_message(chat_id, text)
 
 
-def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: int = 0, target_group_id: int | None = None):
+def broadcast_message_to_groups(
+    payload: dict,
+    repeats: int = 1,
+    delay_seconds: int = 0,
+    target_group_id: int | None = None,
+    stop_event: threading.Event | None = None,
+    batch_size: int = BROADCAST_BATCH_SIZE,
+):
     if target_group_id is None:
         groups = list_groups(limit=10_000)
     else:
@@ -774,6 +881,7 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
 
     repeats = max(1, int(repeats or 1))
     delay_seconds = max(0, int(delay_seconds or 0))
+    batch_size = max(1, int(batch_size or 1))
 
     if not groups:
         return 0, 0, 0
@@ -797,35 +905,49 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
         ordered_workers = workers[rotation:] + workers[:rotation]
 
         for bot_row, target_bot in ordered_workers:
-            for attempt in range(2):
+            if stop_event and stop_event.is_set():
+                return False, RuntimeError("broadcast stopped")
+            for attempt in range(3):
                 try:
                     send_payload_with_bot(target_bot, chat_id, payload)
                     return True, None
                 except ApiTelegramException as exc:
                     last_exc = exc
                     err_text = str(exc).lower()
-                    # If this looks temporary, retry once quickly; otherwise move
-                    # on to the next worker bot.
-                    if "retry after" in err_text or "too many requests" in err_text:
-                        time.sleep(0.12 * (attempt + 1))
+                    retry_after = _extract_retry_after_seconds(exc)
+                    if retry_after > 0:
+                        time.sleep(min(retry_after, 5.0))
+                        continue
+                    if "retry after" in err_text or "too many requests" in err_text or "flood" in err_text:
+                        time.sleep(min(0.4 * (attempt + 1), 2.0))
+                        continue
+                    if "bad gateway" in err_text or "timeout" in err_text or "server error" in err_text:
+                        time.sleep(min(0.2 * (attempt + 1), 1.0))
                         continue
                     break
                 except Exception as exc:
                     last_exc = exc
-                    time.sleep(0.05 * (attempt + 1))
-                    break
+                    time.sleep(min(0.15 * (attempt + 1), 1.0))
+                    continue
 
         return False, last_exc
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    max_workers = min(32, max(8, len(groups)))
+    # For multiple groups, we keep concurrency moderate. For a single selected
+    # group with many repeats, the outer batching below controls the pace.
+    max_workers = min(24, max(2, len(groups)))
 
     try:
         for round_index in range(repeats):
+            if stop_event and stop_event.is_set():
+                break
+
             futures = []
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 for group_index, group in enumerate(groups):
+                    if stop_event and stop_event.is_set():
+                        break
                     chat_id = int(group["chat_id"])
                     futures.append(executor.submit(_broadcast_one, group_index + round_index, chat_id))
 
@@ -836,12 +958,19 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
                     else:
                         failed += 1
 
-            if round_index < repeats - 1 and delay_seconds:
+            # Chunked pacing: after every batch of N rounds, pause briefly to
+            # keep delivery stable under Telegram's rate limits.
+            if stop_event and stop_event.is_set():
+                break
+            if (round_index + 1) % batch_size == 0 and round_index < repeats - 1:
+                time.sleep(max(0.15, delay_seconds or BROADCAST_CHUNK_PAUSE))
+            elif delay_seconds and round_index < repeats - 1:
                 time.sleep(delay_seconds)
     finally:
         _cleanup_broadcast_media(payload)
 
     return total, sent, failed
+
 
 def render_group_hint():
 
@@ -1015,6 +1144,18 @@ def broadcast_cmd(message):
         return
     set_state(message.from_user.id, "await_broadcast_group")
     show_broadcast_group_prompt(message.chat.id, message.from_user.id)
+
+
+@bot.message_handler(commands=["stopbroadcast"])
+def stopbroadcast_cmd(message):
+    ensure_user(message.from_user.id)
+    if not require_admin(message):
+        return
+    lang = current_lang(message.from_user.id)
+    if stop_active_broadcast(message.from_user.id):
+        bot.reply_to(message, t(lang, "broadcast_stop_requested"))
+    else:
+        bot.reply_to(message, t(lang, "cancelled"))
 
 
 @bot.message_handler(commands=["register"])
@@ -1454,26 +1595,33 @@ def content_router(message):
         repeats = max(1, int(row["pending_repeats"] or 1))
         delay = max(0, int(row["pending_delay"] or 0))
         payload = extract_broadcast_payload(message)
+        target_group_id = int(row["pending_group_id"] or 0) or None
+        reset_pending(message.from_user.id)
+
+        # Launch the broadcast in the background so it can run in chunks and be
+        # stopped without freezing the bot chat session.
         try:
-            total, sent, failed = broadcast_message_to_groups(
-                payload,
+            start_background_broadcast(
+                user_id=message.from_user.id,
+                chat_id=message.chat.id,
+                lang=lang,
+                payload=payload,
                 repeats=repeats,
                 delay_seconds=delay,
-                target_group_id=int(row["pending_group_id"] or 0) or None,
+                target_group_id=target_group_id,
             )
-            result_text = f"✅ Broadcast finished.\nTargets: {total}\nSent: {sent}\nFailed: {failed}"
+            bot.reply_to(
+                message,
+                t(lang, "broadcast_started"),
+                reply_markup=main_menu_keyboard(message.from_user.id, lang),
+            )
         except Exception as exc:
             log.exception("Broadcast crashed for user %s", message.from_user.id)
-            total = sent = 0
-            failed = 0
-            result_text = f"⚠️ Broadcast failed unexpectedly.\n{exc}"
-        finally:
-            reset_pending(message.from_user.id)
-        bot.reply_to(
-            message,
-            result_text,
-            reply_markup=main_menu_keyboard(message.from_user.id, lang),
-        )
+            bot.reply_to(
+                message,
+                f"⚠️ Broadcast failed unexpectedly.\n{exc}",
+                reply_markup=main_menu_keyboard(message.from_user.id, lang),
+            )
         return
 
 
