@@ -1,34 +1,22 @@
 services:
   - type: web
-    name: pmc-engine
+    name: pmc-bot
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --workers 1 --worker-class gthread --threads 4 --timeout 120 app:app
+    startCommand: gunicorn app:app
     envVars:
       - key: BOT_TOKEN
         sync: false
       - key: WEBHOOK_SECRET
-        generateValue: true
+        value: pmc_secret
       - key: WEBHOOK_URL
         sync: false
-      - key: ADMIN_IDS
-        sync: false
-      - key: OWNER_ID
-        sync: false
       - key: DATABASE_PATH
-        value: /var/data/pmc_bot.sqlite3
-      - key: LOG_LEVEL
-        value: INFO
-      - key: BROADCAST_WORKERS
-        value: 4
+        value: pmc_bot.sqlite3
+      - key: MAX_GROUPS_PER_PAGE
+        value: "5"
       - key: MAX_REPEATS
-        value: 1000
+        value: "1000"
       - key: MAX_DELAY_SECONDS
-        value: 300
-      - key: RETRY_ATTEMPTS
-        value: 5
-      - key: RETRY_BASE_DELAY
-        value: 0.8
-      - key: DEFAULT_REPEAT_DELAY
-        value: 0.05
+        value: "3600"

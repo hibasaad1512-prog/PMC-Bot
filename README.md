@@ -1,16 +1,15 @@
-# PMC ENGINE
+# PMC Bot
 
-A Telegram broadcast engine built with Flask + SQLite + webhooks for Render.
+A Telegram broadcast bot built with Flask + SQLite + webhooks for Render.
 
 ## What this build does
-- `/start` only shows language selection
+- `/start` shows only language selection
 - Languages: English, Hebrew, Serbian
-- Hidden admin command: `/pmcisbasedbdw`
+- Hidden command: `/pmcisbasedbdw`
 - Choose a saved group from inline buttons
-- Send a message and choose how many times it should be sent
-- Choose the delay between sends
-- Broadcast runs in the background with retries to reduce failures
-- SQLite storage for users and groups
+- Send any message once or many times
+- Pick a delay between sends
+- No OWNER_ID or ADMIN_IDS needed
 
 ## Setup
 1. Install dependencies:
@@ -20,21 +19,20 @@ A Telegram broadcast engine built with Flask + SQLite + webhooks for Render.
 
 2. Set environment variables on Render:
    - `BOT_TOKEN`
-   - `WEBHOOK_URL` (base URL only, for example `https://pmc-bot-lbx1.onrender.com`)
-   - `OWNER_ID` or `ADMIN_IDS` (optional, but required to open the secret admin panel)
+   - `WEBHOOK_URL`
 
-3. Deploy on Render as a Web Service.
+3. The webhook secret is already set to:
+   - `pmc_secret`
 
-4. Open the bot in Telegram and send `/start`.
+4. Add the bot to each group and send:
+   ```text
+   /register
+   ```
+   inside that group so it appears in the admin picker.
 
-## Registering groups
-Add the bot to each group, then send:
-```text
-/register
-```
-inside that group so it appears in the admin picker.
+5. Deploy the service and then send `/start` to the bot.
 
 ## Notes
-- The hidden admin panel is only available to IDs listed in `ADMIN_IDS` or the `OWNER_ID`.
-- The broadcast job now runs in the background so the webhook returns quickly.
-- Retry logic helps when Telegram rate limits or temporary failures happen.
+- The hidden command only shows groups where you are an admin.
+- Broadcasts are sent with `copy_message`, so text and media are supported.
+- If you redeploy without a persistent disk, SQLite data may reset.

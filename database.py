@@ -4,8 +4,10 @@ from pathlib import Path
 from config import DATABASE_PATH
 
 def get_connection():
-    Path(DATABASE_PATH).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    db_path = Path(DATABASE_PATH)
+    if db_path.parent != Path("."):
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -98,7 +100,14 @@ def ensure_user(user_id: int):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT OR IGNORE INTO users (user_id, language, state, pending_group_id, pending_message_chat_id, pending_message_id, pending_repeats, pending_delay) VALUES (?, NULL, NULL, NULL, NULL, NULL, 1, 0)",
+        """
+        INSERT OR IGNORE INTO users (
+            user_id, language, state,
+            pending_group_id, pending_message_chat_id, pending_message_id,
+            pending_repeats, pending_delay
+        )
+        VALUES (?, NULL, NULL, NULL, NULL, NULL, 1, 0)
+        """,
         (user_id,),
     )
     conn.commit()
@@ -110,14 +119,12 @@ def update_user(user_id: int, **fields):
     ensure_user(user_id)
     conn = get_connection()
     cur = conn.cursor()
-    keys = []
-    values = []
-    for k, v in fields.items():
-        keys.append(f"{k}=?")
-        values.append(v)
-    values.append(user_id)
-    sql = f"UPDATE users SET {', '.join(keys)}, updated_at=CURRENT_TIMESTAMP WHERE user_id=?"
-    cur.execute(sql, values)
+    assignments = ", ".join([f"{key}=?" for key in fields.keys()])
+    values = list(fields.values()) + [user_id]
+    cur.execute(
+        f"UPDATE users SET {assignments}, updated_at=CURRENT_TIMESTAMP WHERE user_id=?",
+        values,
+    )
     conn.commit()
     conn.close()
 
