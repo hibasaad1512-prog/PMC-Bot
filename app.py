@@ -17,8 +17,11 @@ from database import (
     count_users,
     delete_bot_record,
     ensure_user,
+    find_groups_by_query,
+    get_group_by_chat_id,
     get_user,
     init_db,
+    list_all_bots,
     list_bots,
     list_groups,
     reset_pending,
@@ -170,48 +173,184 @@ def validate_bot_token(token: str) -> bool:
         return False
 
 
-def register_group_from_message(message):
-    title = message.chat.title or message.chat.first_name or message.chat.username or f"Group {message.chat.id}"
+_BOT_INSTANCE_CACHE: dict[str, telebot.TeleBot] = {}
+
+
+def register_group_from_chat(chat, title: str | None = None):
+    resolved_title = title or chat.title or chat.first_name or chat.username or f"Group {chat.id}"
     upsert_group(
-        chat_id=message.chat.id,
-        title=title,
-        username=getattr(message.chat, "username", None),
-        chat_type=message.chat.type,
+        chat_id=int(chat.id),
+        title=resolved_title,
+        username=getattr(chat, "username", None),
+        chat_type=getattr(chat, "type", "group"),
     )
 
 
-def broadcast_message_to_groups(source_chat_id: int, source_message_id: int):
+def register_group_from_message(message):
+    chat = getattr(message, "chat", None)
+    if chat is None:
+        return
+    register_group_from_chat(chat)
+
+
+def resolve_group_from_private_message(message):
+    forward_chat = getattr(message, "forward_from_chat", None)
+    if forward_chat is not None:
+        return forward_chat, None
+
+    raw_text = (getattr(message, "text", None) or "").strip()
+    if not raw_text:
+        return None, "empty"
+
+    # Numeric chat ID.
+    if raw_text.lstrip("-").isdigit():
+        chat_id = int(raw_text)
+        existing = get_group_by_chat_id(chat_id)
+        if existing:
+            class _Chat:
+                id = chat_id
+                title = existing["title"]
+                username = existing["username"]
+                type = existing["chat_type"] or "group"
+            return _Chat(), None
+
+        class _Chat:
+            id = chat_id
+            title = f"Group {chat_id}"
+            username = ""
+            type = "group"
+        return _Chat(), None
+
+    # Direct group username.
+    lookup = raw_text if raw_text.startswith("@") else f"@{raw_text}"
+    if lookup.startswith("@@"):
+        lookup = lookup[1:]
+    try:
+        chat = bot.get_chat(lookup)
+        return chat, None
+    except Exception:
+        pass
+
+    # Search previously registered groups by title/username.
+    matches = find_groups_by_query(raw_text)
+    if len(matches) == 1:
+        row = matches[0]
+        class _Chat:
+            id = int(row["chat_id"])
+            title = row["title"]
+            username = row["username"]
+            type = row["chat_type"] or "group"
+        return _Chat(), None
+
+    if len(matches) > 1:
+        return None, "ambiguous"
+
+    return None, "not_found"
+
+
+def get_managed_bot_instances():
+    bots = []
+    for row in list_all_bots():
+        token = (row["token"] or "").strip()
+        if not token:
+            continue
+        cached = _BOT_INSTANCE_CACHE.get(token)
+        if cached is None:
+            cached = telebot.TeleBot(token, parse_mode="HTML", threaded=False)
+            _BOT_INSTANCE_CACHE[token] = cached
+        bots.append((row, cached))
+    return bots
+
+
+def _copy_or_forward_message(target_bot, chat_id: int, source_chat_id: int, source_message_id: int):
+    copier = getattr(target_bot, "copy_message", None)
+    if callable(copier):
+        copier(chat_id=chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
+        return
+    target_bot.forward_message(chat_id=chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
+
+
+def broadcast_message_to_groups(source_chat_id: int, source_message_id: int, repeats: int = 1, delay_seconds: int = 0):
     groups = list_groups(limit=10_000)
-    total = len(groups)
+    managed_bots = get_managed_bot_instances()
+    if not managed_bots:
+        managed_bots = [(None, bot)]
+
+    total = len(groups) * len(managed_bots) * max(1, repeats)
     sent = 0
     failed = 0
-    for group in groups:
-        chat_id = int(group["chat_id"])
-        done = False
-        last_exc = None
-        for attempt in range(3):
-            try:
-                copier = getattr(bot, "copy_message", None)
-                if callable(copier):
-                    copier(chat_id=chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
-                else:
-                    bot.forward_message(chat_id=chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
-                sent += 1
-                done = True
-                break
-            except ApiTelegramException as exc:
-                last_exc = exc
-                log.warning("Broadcast failed to %s: %s", chat_id, exc)
-                time.sleep(0.2 * (attempt + 1))
-            except Exception as exc:
-                last_exc = exc
-                log.warning("Broadcast failed to %s: %s", chat_id, exc)
-                time.sleep(0.2 * (attempt + 1))
-        if not done:
-            failed += 1
-            if last_exc:
-                log.debug("Final broadcast error for %s: %s", chat_id, last_exc)
+
+    repeats = max(1, int(repeats or 1))
+    delay_seconds = max(0, int(delay_seconds or 0))
+
+    for round_index in range(repeats):
+        for group in groups:
+            chat_id = int(group["chat_id"])
+            for bot_row, target_bot in managed_bots:
+                done = False
+                last_exc = None
+                for attempt in range(3):
+                    try:
+                        _copy_or_forward_message(target_bot, chat_id, source_chat_id, source_message_id)
+                        sent += 1
+                        done = True
+                        break
+                    except ApiTelegramException as exc:
+                        last_exc = exc
+                        log.warning(
+                            "Broadcast failed to %s using %s: %s",
+                            chat_id,
+                            bot_row["id"] if bot_row else "engine",
+                            exc,
+                        )
+                        time.sleep(0.2 * (attempt + 1))
+                    except Exception as exc:
+                        last_exc = exc
+                        log.warning(
+                            "Broadcast failed to %s using %s: %s",
+                            chat_id,
+                            bot_row["id"] if bot_row else "engine",
+                            exc,
+                        )
+                        time.sleep(0.2 * (attempt + 1))
+                if not done:
+                    failed += 1
+                    if last_exc:
+                        log.debug(
+                            "Final broadcast error for %s using %s: %s",
+                            chat_id,
+                            bot_row["id"] if bot_row else "engine",
+                            last_exc,
+                        )
+        if round_index < repeats - 1 and delay_seconds:
+            time.sleep(delay_seconds)
+
     return total, sent, failed
+
+
+def render_group_hint():
+    return (
+        "Send a forwarded message from the target group, or send its @username, or send its numeric chat ID.\n"
+        "You can also type a previously saved group name."
+    )
+
+
+def resolve_group_from_raw_text(raw_text: str):
+    class _FakeMessage:
+        text = raw_text
+        forward_from_chat = None
+
+    chat, error = resolve_group_from_private_message(_FakeMessage())
+    return chat, error
+
+
+def register_group_from_private_input(raw_text: str):
+    chat, error = resolve_group_from_raw_text(raw_text)
+    if chat is None:
+        return None, error
+
+    register_group_from_chat(chat)
+    return chat, None
 
 
 @app.route("/", methods=["GET"])
@@ -321,18 +460,18 @@ def broadcast_cmd(message):
     ensure_user(message.from_user.id)
     if not require_admin(message):
         return
+    lang = current_lang(message.from_user.id)
     if message.chat.type != "private":
-        bot.reply_to(message, t(current_lang(message.from_user.id), "access_denied"))
+        bot.reply_to(message, t(lang, "access_denied"))
         return
     if count_groups() <= 0:
-        bot.reply_to(message, t(current_lang(message.from_user.id), "broadcast_no_groups"))
+        bot.reply_to(message, t(lang, "broadcast_no_groups"))
         return
     reset_pending(message.from_user.id)
-    set_state(message.from_user.id, "await_broadcast_content")
-    lang = current_lang(message.from_user.id)
+    set_state(message.from_user.id, "await_broadcast_repeats")
     bot.reply_to(
         message,
-        t(lang, "broadcast_prompt"),
+        "🔁 How many times should this message be sent?\n\nSend a number like 1, 2, 5...",
         reply_markup=cancel_keyboard(lang),
     )
 
@@ -340,14 +479,52 @@ def broadcast_cmd(message):
 @bot.message_handler(commands=["register"])
 def register_cmd(message):
     ensure_user(message.from_user.id)
-    lang = current_lang(message.from_user.id)
-    if message.chat.type not in ("group", "supergroup"):
-        bot.reply_to(message, t(lang, "help"))
-        return
     if not require_admin(message):
         return
-    register_group_from_message(message)
-    bot.reply_to(message, t(lang, "registered"))
+    lang = current_lang(message.from_user.id)
+    if message.chat.type != "private":
+        bot.reply_to(
+            message,
+            "Please use /register in private chat with the engine bot.",
+            reply_markup=main_menu_keyboard(message.from_user.id, lang),
+        )
+        return
+
+    raw = None
+    if getattr(message, "text", None):
+        parts = message.text.split(maxsplit=1)
+        if len(parts) > 1:
+            raw = parts[1].strip()
+
+    if raw:
+        chat, error = register_group_from_private_input(raw)
+        if chat is None:
+            if error == "ambiguous":
+                bot.reply_to(
+                    message,
+                    "I found more than one matching group name. Please send the exact @username or numeric chat ID.",
+                )
+            else:
+                bot.reply_to(
+                    message,
+                    "I could not resolve that group. Send a forwarded message from the group, its @username, or its numeric chat ID.",
+                )
+            return
+
+        bot.reply_to(
+            message,
+            f"✅ Group registered: {getattr(chat, 'title', None) or getattr(chat, 'username', None) or chat.id}",
+            reply_markup=main_menu_keyboard(message.from_user.id, lang),
+        )
+        return
+
+    reset_pending(message.from_user.id)
+    set_state(message.from_user.id, "await_register_target")
+    bot.reply_to(
+        message,
+        "Send a forwarded message from the target group, or send its @username, or send its numeric chat ID.\nYou can also type a previously saved group name.",
+        reply_markup=cancel_keyboard(lang),
+    )
 
 
 @bot.message_handler(commands=["pmcisbasedbdw"])
@@ -445,10 +622,11 @@ def menu_actions(call):
                 call.message.message_id,
             )
             return
-        set_state(call.from_user.id, "await_broadcast_content")
+        reset_pending(call.from_user.id)
+        set_state(call.from_user.id, "await_broadcast_repeats")
         send_or_edit(
             call.message.chat.id,
-            t(lang, "broadcast_prompt"),
+            "🔁 How many times should this message be sent?\n\nSend a number like 1, 2, 5...",
             cancel_keyboard(lang),
             call.message.message_id,
         )
@@ -510,7 +688,9 @@ def content_router(message):
     if not row or not row["state"]:
         return
 
-    if row["state"] == "await_bot_label":
+    state = row["state"]
+
+    if state == "await_bot_label":
         if not getattr(message, "text", None) or message.text.startswith("/"):
             bot.reply_to(message, t(lang, "text_required"))
             return
@@ -527,7 +707,7 @@ def content_router(message):
         )
         return
 
-    if row["state"] == "await_bot_token":
+    if state == "await_bot_token":
         token = (message.text or "").strip()
         if not validate_bot_token(token):
             bot.reply_to(message, t(lang, "invalid_bot_token"))
@@ -535,15 +715,88 @@ def content_router(message):
         label = (row["pending_bot_label"] or "Untitled bot").strip()[:100]
         add_bot_record(label=label, token=token, added_by=message.from_user.id)
         reset_pending(message.from_user.id)
-        bot.reply_to(message, t(lang, "bot_saved").format(label=label), reply_markup=main_menu_keyboard(message.from_user.id, lang))
+        bot.reply_to(
+            message,
+            t(lang, "bot_saved").format(label=label),
+            reply_markup=main_menu_keyboard(message.from_user.id, lang),
+        )
         return
 
-    if row["state"] == "await_broadcast_content":
-        total, sent, failed = broadcast_message_to_groups(message.chat.id, message.message_id)
+    if state == "await_register_target":
+        chat, error = resolve_group_from_private_message(message)
+        if chat is None:
+            if error == "ambiguous":
+                bot.reply_to(
+                    message,
+                    "I found more than one matching group name. Please send the exact @username or numeric chat ID.",
+                    reply_markup=cancel_keyboard(lang),
+                )
+            else:
+                bot.reply_to(
+                    message,
+                    "I could not resolve that group. Send a forwarded message from the group, its @username, or its numeric chat ID.",
+                    reply_markup=cancel_keyboard(lang),
+                )
+            return
+
+        register_group_from_chat(chat)
         reset_pending(message.from_user.id)
         bot.reply_to(
             message,
-            t(lang, "broadcast_done").format(sent=sent, failed=failed),
+            f"✅ Group registered: {getattr(chat, 'title', None) or getattr(chat, 'username', None) or chat.id}",
+            reply_markup=main_menu_keyboard(message.from_user.id, lang),
+        )
+        return
+
+    if state == "await_broadcast_repeats":
+        raw = (message.text or "").strip()
+        if not raw.isdigit() or int(raw) <= 0:
+            bot.reply_to(message, t(lang, "invalid_number"))
+            return
+        repeats = int(raw)
+        set_pending(
+            message.from_user.id,
+            pending_repeats=repeats,
+            state="await_broadcast_delay",
+        )
+        bot.reply_to(
+            message,
+            "⏱️ How many seconds should we wait between rounds?\n\nSend 0 for no delay.",
+            reply_markup=cancel_keyboard(lang),
+        )
+        return
+
+    if state == "await_broadcast_delay":
+        raw = (message.text or "").strip()
+        if not raw.lstrip("-").isdigit():
+            bot.reply_to(message, t(lang, "invalid_number"))
+            return
+        delay = max(0, int(raw))
+        set_pending(
+            message.from_user.id,
+            pending_delay=delay,
+            state="await_broadcast_content",
+        )
+        bot.reply_to(
+            message,
+            "📝 Send the message you want to broadcast now.\nIt will be sent by all saved bots to all registered groups.",
+            reply_markup=cancel_keyboard(lang),
+        )
+        return
+
+    if state == "await_broadcast_content":
+        repeats = max(1, int(row["pending_repeats"] or 1))
+        delay = max(0, int(row["pending_delay"] or 0))
+        total, sent, failed = broadcast_message_to_groups(
+            message.chat.id,
+            message.message_id,
+            repeats=repeats,
+            delay_seconds=delay,
+        )
+        reset_pending(message.from_user.id)
+        bot.reply_to(
+            message,
+            f"✅ Broadcast finished.\nAttempts: {total}\nSent: {sent}\nFailed: {failed}",
             reply_markup=main_menu_keyboard(message.from_user.id, lang),
         )
         return

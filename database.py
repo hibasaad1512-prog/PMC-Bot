@@ -98,6 +98,57 @@ def upsert_group(chat_id: int, title: str, username: str | None, chat_type: str)
     conn.close()
 
 
+def get_group_by_chat_id(chat_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT chat_id, title, username, chat_type, is_active, updated_at
+        FROM groups
+        WHERE chat_id=?
+        """,
+        (chat_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def find_groups_by_query(query: str):
+    raw = (query or "").strip()
+    if not raw:
+        return []
+
+    conn = get_connection()
+    cur = conn.cursor()
+    if raw.lstrip("-").isdigit():
+        chat_id = int(raw)
+        cur.execute(
+            """
+            SELECT chat_id, title, username, chat_type, is_active, updated_at
+            FROM groups
+            WHERE chat_id=?
+            """,
+            (chat_id,),
+        )
+    else:
+        lowered = f"%{raw.lower()}%"
+        cur.execute(
+            """
+            SELECT chat_id, title, username, chat_type, is_active, updated_at
+            FROM groups
+            WHERE LOWER(title) LIKE ?
+               OR LOWER(username) LIKE ?
+            ORDER BY is_active DESC, title COLLATE NOCASE ASC
+            LIMIT 20
+            """,
+            (lowered, lowered),
+        )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
 def list_groups(offset: int = 0, limit: int = 100):
     conn = get_connection()
     cur = conn.cursor()
@@ -123,6 +174,19 @@ def count_groups() -> int:
     value = cur.fetchone()["c"]
     conn.close()
     return int(value)
+
+
+def deactivate_group(chat_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE groups SET is_active=0, updated_at=CURRENT_TIMESTAMP WHERE chat_id=?",
+        (chat_id,),
+    )
+    conn.commit()
+    updated = cur.rowcount
+    conn.close()
+    return updated > 0
 
 
 def count_users() -> int:
@@ -235,6 +299,22 @@ def list_bots(offset: int = 0, limit: int = 100):
         LIMIT ? OFFSET ?
         """,
         (limit, offset),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def list_all_bots():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, label, token, added_by, is_active, created_at, updated_at
+        FROM bots
+        WHERE is_active=1
+        ORDER BY id ASC
+        """
     )
     rows = cur.fetchall()
     conn.close()
