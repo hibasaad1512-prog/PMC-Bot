@@ -16,6 +16,7 @@ from database import (
     count_bots,
     count_groups,
     count_users,
+    deactivate_group,
     delete_bot_record,
     delete_group_record,
     ensure_user,
@@ -213,6 +214,52 @@ def show_remove_group_prompt(chat_id: int, user_id: int, page: int = 0, message_
     page = max(0, min(page, max_page))
     text = f"🗑️ Remove a group\n\nSelect a saved group to delete it from the list."
     send_or_edit(chat_id, text, remove_groups_keyboard(lang, page), message_id)
+
+
+def broadcast_groups_keyboard(lang: str, page: int = 0):
+    total = count_groups()
+    groups = list_groups(offset=page * MAX_GROUPS_PER_PAGE, limit=MAX_GROUPS_PER_PAGE)
+    kb = InlineKeyboardMarkup()
+
+    if not groups:
+        kb.add(InlineKeyboardButton("↩️ Back", callback_data="menu:home"))
+        return kb
+
+    for group_row in groups:
+        title = (group_row["title"] or "Untitled group").strip()
+        if len(title) > 22:
+            title = title[:19] + "..."
+        chat_id = int(group_row["chat_id"])
+        username = (group_row["username"] or "").strip()
+        suffix = f" @{username.lstrip('@')}" if username else ""
+        kb.add(InlineKeyboardButton(f"{title}{suffix}", callback_data=f"bg:{page}:{chat_id}"))
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"bg_page:{page-1}"))
+    if (page + 1) * MAX_GROUPS_PER_PAGE < total:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"bg_page:{page+1}"))
+    if nav:
+        kb.row(*nav)
+
+    kb.row(
+        InlineKeyboardButton("↩️ Back", callback_data="menu:home"),
+        InlineKeyboardButton(t(lang, "cancel"), callback_data="cancel"),
+    )
+    return kb
+
+
+def show_broadcast_group_prompt(chat_id: int, user_id: int, page: int = 0, message_id: Optional[int] = None):
+    lang = current_lang(user_id)
+    total = count_groups()
+    if total <= 0:
+        send_or_edit(chat_id, t(lang, "broadcast_no_groups"), main_menu_keyboard(user_id, lang), message_id)
+        return
+
+    max_page = max(0, (total - 1) // MAX_GROUPS_PER_PAGE)
+    page = max(0, min(page, max_page))
+    text = f"{t(lang, 'choose_group')}\n\n{t(lang, 'select_broadcast_group')}"
+    send_or_edit(chat_id, text, broadcast_groups_keyboard(lang, page), message_id)
 
 
 def normalize_group_reference(raw_text: str) -> str:
@@ -457,8 +504,12 @@ def send_payload_with_bot(target_bot, chat_id: int, payload: dict):
     return target_bot.send_message(chat_id, text)
 
 
-def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: int = 0):
-    groups = list_groups(limit=10_000)
+def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: int = 0, target_group_id: int | None = None):
+    if target_group_id is None:
+        groups = list_groups(limit=10_000)
+    else:
+        target = get_group_by_chat_id(int(target_group_id))
+        groups = [target] if target else []
     managed_bots = get_managed_bot_instances()
 
     repeats = max(1, int(repeats or 1))
@@ -698,12 +749,8 @@ def broadcast_cmd(message):
         bot.reply_to(message, "No follower bots are active yet. Add at least one bot first.")
         return
     reset_pending(message.from_user.id)
-    set_state(message.from_user.id, "await_broadcast_repeats")
-    bot.reply_to(
-        message,
-        "🔁 How many times should this message be sent?\n\nSend a number like 1, 2, 5...",
-        reply_markup=cancel_keyboard(lang),
-    )
+    set_state(message.from_user.id, "await_broadcast_group")
+    show_broadcast_group_prompt(message.chat.id, message.from_user.id)
 
 
 @bot.message_handler(commands=["register"])
@@ -776,6 +823,19 @@ def on_new_chat_members(message):
             bot.reply_to(message, t(current_lang(message.from_user.id), "group_registered_auto"))
     except Exception as exc:
         log.warning("Failed to register new group: %s", exc)
+
+
+@bot.message_handler(content_types=["left_chat_member"])
+def on_left_chat_member(message):
+    ensure_user(message.from_user.id)
+    if BOT_ID is None:
+        return
+    try:
+        left = getattr(message, "left_chat_member", None)
+        if left is not None and getattr(left, "id", None) == BOT_ID:
+            deactivate_group(int(message.chat.id))
+    except Exception as exc:
+        log.warning("Failed to deactivate left group: %s", exc)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("lang:"))
@@ -861,13 +921,8 @@ def menu_actions(call):
             )
             return
         reset_pending(call.from_user.id)
-        set_state(call.from_user.id, "await_broadcast_repeats")
-        send_or_edit(
-            call.message.chat.id,
-            "🔁 How many times should this message be sent?\n\nSend a number like 1, 2, 5...",
-            cancel_keyboard(lang),
-            call.message.message_id,
-        )
+        set_state(call.from_user.id, "await_broadcast_group")
+        show_broadcast_group_prompt(call.message.chat.id, call.from_user.id, message_id=call.message.message_id)
     elif action == "home":
         show_main_menu(call.message.chat.id, call.from_user.id, message_id=call.message.message_id)
 
@@ -941,6 +996,54 @@ def remove_group(call):
     ok = delete_group_record(chat_id)
     bot.answer_callback_query(call.id, "Group removed successfully." if ok else "Could not remove that group.", show_alert=not ok)
     show_remove_group_prompt(call.message.chat.id, call.from_user.id, page=page, message_id=call.message.message_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("bg_page:"))
+def paginate_broadcast_groups(call):
+    ensure_user(call.from_user.id)
+    if not require_admin(call.message):
+        return
+    try:
+        page = max(0, int(call.data.split(":", 1)[1]))
+    except Exception:
+        page = 0
+    bot.answer_callback_query(call.id)
+    show_broadcast_group_prompt(call.message.chat.id, call.from_user.id, page=page, message_id=call.message.message_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("bg:"))
+def choose_broadcast_group(call):
+    ensure_user(call.from_user.id)
+    if not require_admin(call.message):
+        return
+    lang = current_lang(call.from_user.id)
+    parts = call.data.split(":")
+    if len(parts) != 3:
+        bot.answer_callback_query(call.id)
+        return
+
+    try:
+        page = max(0, int(parts[1]))
+        chat_id = int(parts[2])
+    except Exception:
+        bot.answer_callback_query(call.id)
+        return
+
+    group = get_group_by_chat_id(chat_id)
+    if not group:
+        bot.answer_callback_query(call.id, "That group is no longer saved.", show_alert=True)
+        show_broadcast_group_prompt(call.message.chat.id, call.from_user.id, page=page, message_id=call.message.message_id)
+        return
+
+    title = (group["title"] or group["username"] or f"Group {chat_id}").strip()
+    set_pending(call.from_user.id, pending_group_id=chat_id, state="await_broadcast_repeats")
+    bot.answer_callback_query(call.id, f"Selected: {title}")
+    send_or_edit(
+        call.message.chat.id,
+        f"✅ Group selected: {title}\n\n🔁 How many times should this message be sent?\nSend a number like 1, 2, 5...",
+        cancel_keyboard(lang),
+        call.message.message_id,
+    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "cancel")
@@ -1029,6 +1132,32 @@ def content_router(message):
         )
         return
 
+    if state == "await_broadcast_group":
+        chat, error = resolve_group_from_private_message(message)
+        if chat is None:
+            if error == "ambiguous":
+                bot.reply_to(
+                    message,
+                    "I found more than one matching group name. Please send the exact @username or numeric chat ID, or choose a group from the buttons below.",
+                    reply_markup=cancel_keyboard(lang),
+                )
+            else:
+                bot.reply_to(
+                    message,
+                    "I could not resolve that group. Send a forwarded message from the group, its @username, a t.me link, or its numeric chat ID.",
+                    reply_markup=cancel_keyboard(lang),
+                )
+            return
+
+        register_group_from_chat(chat)
+        set_pending(message.from_user.id, pending_group_id=int(chat.id), state="await_broadcast_repeats")
+        bot.reply_to(
+            message,
+            f"✅ Group selected: {getattr(chat, 'title', None) or getattr(chat, 'username', None) or chat.id}\n\n🔁 How many times should this message be sent?\nSend a number like 1, 2, 5...",
+            reply_markup=cancel_keyboard(lang),
+        )
+        return
+
     if state == "await_broadcast_repeats":
         raw = (message.text or "").strip()
         if not raw.isdigit() or int(raw) <= 0:
@@ -1074,6 +1203,7 @@ def content_router(message):
                 payload,
                 repeats=repeats,
                 delay_seconds=delay,
+                target_group_id=int(row["pending_group_id"] or 0) or None,
             )
             result_text = f"✅ Broadcast finished.\nAttempts: {total}\nSent: {sent}\nFailed: {failed}"
         except Exception as exc:
