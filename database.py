@@ -125,6 +125,15 @@ def count_groups() -> int:
     return int(value)
 
 
+def count_users() -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) AS c FROM users")
+    value = cur.fetchone()["c"]
+    conn.close()
+    return int(value)
+
+
 def get_user(user_id: int):
     conn = get_connection()
     cur = conn.cursor()

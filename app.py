@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import time
 from typing import Optional
 
 from flask import Flask, abort, request
@@ -8,19 +9,23 @@ import telebot
 from telebot.apihelper import ApiTelegramException
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from config import BOT_TOKEN, WEBHOOK_URL, MAX_GROUPS_PER_PAGE
+from config import ADMIN_IDS, BOT_TOKEN, MAX_GROUPS_PER_PAGE, WEBHOOK_URL
 from database import (
     add_bot_record,
     count_bots,
+    count_groups,
+    count_users,
     delete_bot_record,
     ensure_user,
     get_user,
     init_db,
     list_bots,
+    list_groups,
     reset_pending,
     set_language,
     set_pending,
     set_state,
+    upsert_group,
 )
 from translations import LANG_BUTTONS, t
 
@@ -33,13 +38,26 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing in Render environment variables.")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=False)
-
 BOT_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
+
+BOT_ID: int | None = None
 
 
 def current_lang(user_id: int) -> str:
     row = get_user(user_id)
     return row["language"] if row and row["language"] else "en"
+
+
+def is_admin(user_id: int) -> bool:
+    return not ADMIN_IDS or user_id in ADMIN_IDS
+
+
+def require_admin(message) -> bool:
+    if is_admin(message.from_user.id):
+        return True
+    lang = current_lang(message.from_user.id)
+    bot.reply_to(message, t(lang, "access_denied"))
+    return False
 
 
 def lang_keyboard():
@@ -49,7 +67,7 @@ def lang_keyboard():
     return kb
 
 
-def main_menu_keyboard(lang: str | None = None):
+def main_menu_keyboard(user_id: int, lang: str | None = None):
     lang = lang if lang in ("en", "he", "sr") else "en"
     kb = InlineKeyboardMarkup()
     kb.row(
@@ -60,6 +78,12 @@ def main_menu_keyboard(lang: str | None = None):
         InlineKeyboardButton(t(lang, "menu_language"), callback_data="menu:language"),
         InlineKeyboardButton(t(lang, "menu_help"), callback_data="menu:help"),
     )
+    kb.row(
+        InlineKeyboardButton(t(lang, "menu_ping"), callback_data="menu:ping"),
+        InlineKeyboardButton(t(lang, "menu_stats"), callback_data="menu:stats"),
+    )
+    if is_admin(user_id):
+        kb.row(InlineKeyboardButton(t(lang, "menu_broadcast"), callback_data="menu:broadcast"))
     return kb
 
 
@@ -113,7 +137,7 @@ def send_or_edit(chat_id: int, text: str, reply_markup=None, message_id: Optiona
 
 def show_main_menu(chat_id: int, user_id: int, message_id: Optional[int] = None):
     lang = current_lang(user_id)
-    send_or_edit(chat_id, t(lang, "main_menu"), main_menu_keyboard(lang), message_id)
+    send_or_edit(chat_id, t(lang, "main_menu"), main_menu_keyboard(user_id, lang), message_id)
 
 
 def show_language_prompt(chat_id: int, user_id: int, message_id: Optional[int] = None):
@@ -125,7 +149,7 @@ def show_remove_prompt(chat_id: int, user_id: int, page: int = 0, message_id: Op
     lang = current_lang(user_id)
     total = count_bots()
     if total <= 0:
-        send_or_edit(chat_id, t(lang, "no_bots"), main_menu_keyboard(lang), message_id)
+        send_or_edit(chat_id, t(lang, "no_bots"), main_menu_keyboard(user_id, lang), message_id)
         return
 
     max_page = max(0, (total - 1) // MAX_GROUPS_PER_PAGE)
@@ -144,6 +168,50 @@ def validate_bot_token(token: str) -> bool:
         return bool(me and getattr(me, "id", None))
     except Exception:
         return False
+
+
+def register_group_from_message(message):
+    title = message.chat.title or message.chat.first_name or message.chat.username or f"Group {message.chat.id}"
+    upsert_group(
+        chat_id=message.chat.id,
+        title=title,
+        username=getattr(message.chat, "username", None),
+        chat_type=message.chat.type,
+    )
+
+
+def broadcast_message_to_groups(source_chat_id: int, source_message_id: int):
+    groups = list_groups(limit=10_000)
+    total = len(groups)
+    sent = 0
+    failed = 0
+    for group in groups:
+        chat_id = int(group["chat_id"])
+        done = False
+        last_exc = None
+        for attempt in range(3):
+            try:
+                copier = getattr(bot, "copy_message", None)
+                if callable(copier):
+                    copier(chat_id=chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
+                else:
+                    bot.forward_message(chat_id=chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
+                sent += 1
+                done = True
+                break
+            except ApiTelegramException as exc:
+                last_exc = exc
+                log.warning("Broadcast failed to %s: %s", chat_id, exc)
+                time.sleep(0.2 * (attempt + 1))
+            except Exception as exc:
+                last_exc = exc
+                log.warning("Broadcast failed to %s: %s", chat_id, exc)
+                time.sleep(0.2 * (attempt + 1))
+        if not done:
+            failed += 1
+            if last_exc:
+                log.debug("Final broadcast error for %s: %s", chat_id, last_exc)
+    return total, sent, failed
 
 
 @app.route("/", methods=["GET"])
@@ -178,50 +246,129 @@ def telegram_webhook(subpath=None):
 @bot.message_handler(commands=["start"])
 def start(message):
     ensure_user(message.from_user.id)
-    row = get_user(message.from_user.id)
-    if row and row["language"]:
-        show_main_menu(message.chat.id, message.from_user.id)
+    lang = current_lang(message.from_user.id)
+    if message.chat.type == "private":
+        row = get_user(message.from_user.id)
+        if row and row["language"]:
+            show_main_menu(message.chat.id, message.from_user.id)
+        else:
+            show_language_prompt(message.chat.id, message.from_user.id)
     else:
-        show_language_prompt(message.chat.id, message.from_user.id)
+        bot.reply_to(message, t(lang, "help"))
 
 
 @bot.message_handler(commands=["help"])
 def help_cmd(message):
     ensure_user(message.from_user.id)
     lang = current_lang(message.from_user.id)
-    bot.reply_to(message, t(lang, "help"), reply_markup=main_menu_keyboard(lang))
+    bot.reply_to(message, t(lang, "help"), reply_markup=main_menu_keyboard(message.from_user.id, lang))
+
+
+@bot.message_handler(commands=["ping"])
+def ping_cmd(message):
+    ensure_user(message.from_user.id)
+    lang = current_lang(message.from_user.id)
+    bot.reply_to(message, t(lang, "ping"))
+
+
+@bot.message_handler(commands=["stats"])
+def stats_cmd(message):
+    ensure_user(message.from_user.id)
+    lang = current_lang(message.from_user.id)
+    text = (
+        f"{t(lang, 'stats_title')}\n\n"
+        f"• {t(lang, 'stats_bots')}: {count_bots()}\n"
+        f"• {t(lang, 'stats_groups')}: {count_groups()}\n"
+        f"• {t(lang, 'stats_users')}: {count_users()}"
+    )
+    bot.reply_to(message, text, reply_markup=main_menu_keyboard(message.from_user.id, lang))
 
 
 @bot.message_handler(commands=["cancel"])
 def cancel_cmd(message):
     ensure_user(message.from_user.id)
     reset_pending(message.from_user.id)
-    bot.reply_to(message, t(current_lang(message.from_user.id), "cancelled"), reply_markup=main_menu_keyboard(current_lang(message.from_user.id)))
+    lang = current_lang(message.from_user.id)
+    bot.reply_to(message, t(lang, "cancelled"), reply_markup=main_menu_keyboard(message.from_user.id, lang))
 
 
 @bot.message_handler(commands=["addbot"])
 def addbot_cmd(message):
     ensure_user(message.from_user.id)
+    if not require_admin(message):
+        return
     reset_pending(message.from_user.id)
     set_state(message.from_user.id, "await_bot_label")
+    lang = current_lang(message.from_user.id)
     bot.reply_to(
         message,
-        t(current_lang(message.from_user.id), "enter_bot_label"),
-        reply_markup=cancel_keyboard(current_lang(message.from_user.id)),
+        t(lang, "enter_bot_label"),
+        reply_markup=cancel_keyboard(lang),
     )
 
 
 @bot.message_handler(commands=["removebot"])
 def removebot_cmd(message):
     ensure_user(message.from_user.id)
+    if not require_admin(message):
+        return
     reset_pending(message.from_user.id)
     show_remove_prompt(message.chat.id, message.from_user.id, page=0)
+
+
+@bot.message_handler(commands=["broadcast"])
+def broadcast_cmd(message):
+    ensure_user(message.from_user.id)
+    if not require_admin(message):
+        return
+    if message.chat.type != "private":
+        bot.reply_to(message, t(current_lang(message.from_user.id), "access_denied"))
+        return
+    if count_groups() <= 0:
+        bot.reply_to(message, t(current_lang(message.from_user.id), "broadcast_no_groups"))
+        return
+    reset_pending(message.from_user.id)
+    set_state(message.from_user.id, "await_broadcast_content")
+    lang = current_lang(message.from_user.id)
+    bot.reply_to(
+        message,
+        t(lang, "broadcast_prompt"),
+        reply_markup=cancel_keyboard(lang),
+    )
+
+
+@bot.message_handler(commands=["register"])
+def register_cmd(message):
+    ensure_user(message.from_user.id)
+    lang = current_lang(message.from_user.id)
+    if message.chat.type not in ("group", "supergroup"):
+        bot.reply_to(message, t(lang, "help"))
+        return
+    if not require_admin(message):
+        return
+    register_group_from_message(message)
+    bot.reply_to(message, t(lang, "registered"))
 
 
 @bot.message_handler(commands=["pmcisbasedbdw"])
 def secret_panel(message):
     ensure_user(message.from_user.id)
+    if not require_admin(message):
+        return
     show_main_menu(message.chat.id, message.from_user.id)
+
+
+@bot.message_handler(content_types=["new_chat_members"])
+def on_new_chat_members(message):
+    ensure_user(message.from_user.id)
+    if BOT_ID is None:
+        return
+    try:
+        if any(getattr(member, "id", None) == BOT_ID for member in message.new_chat_members):
+            register_group_from_message(message)
+            bot.reply_to(message, t(current_lang(message.from_user.id), "group_registered_auto"))
+    except Exception as exc:
+        log.warning("Failed to register new group: %s", exc)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("lang:"))
@@ -241,24 +388,68 @@ def menu_actions(call):
     ensure_user(call.from_user.id)
     action = call.data.split(":", 1)[1]
     bot.answer_callback_query(call.id)
+    lang = current_lang(call.from_user.id)
+
     if action == "addbot":
+        if not require_admin(call.message):
+            return
         reset_pending(call.from_user.id)
         set_state(call.from_user.id, "await_bot_label")
         send_or_edit(
             call.message.chat.id,
-            t(current_lang(call.from_user.id), "enter_bot_label"),
-            cancel_keyboard(current_lang(call.from_user.id)),
+            t(lang, "enter_bot_label"),
+            cancel_keyboard(lang),
             call.message.message_id,
         )
     elif action == "removebot":
+        if not require_admin(call.message):
+            return
         show_remove_prompt(call.message.chat.id, call.from_user.id, page=0, message_id=call.message.message_id)
     elif action == "language":
         show_language_prompt(call.message.chat.id, call.from_user.id, message_id=call.message.message_id)
     elif action == "help":
         send_or_edit(
             call.message.chat.id,
-            t(current_lang(call.from_user.id), "help"),
-            main_menu_keyboard(current_lang(call.from_user.id)),
+            t(lang, "help"),
+            main_menu_keyboard(call.from_user.id, lang),
+            call.message.message_id,
+        )
+    elif action == "ping":
+        send_or_edit(
+            call.message.chat.id,
+            t(lang, "ping"),
+            main_menu_keyboard(call.from_user.id, lang),
+            call.message.message_id,
+        )
+    elif action == "stats":
+        text = (
+            f"{t(lang, 'stats_title')}\n\n"
+            f"• {t(lang, 'stats_bots')}: {count_bots()}\n"
+            f"• {t(lang, 'stats_groups')}: {count_groups()}\n"
+            f"• {t(lang, 'stats_users')}: {count_users()}"
+        )
+        send_or_edit(
+            call.message.chat.id,
+            text,
+            main_menu_keyboard(call.from_user.id, lang),
+            call.message.message_id,
+        )
+    elif action == "broadcast":
+        if not require_admin(call.message):
+            return
+        if count_groups() <= 0:
+            send_or_edit(
+                call.message.chat.id,
+                t(lang, "broadcast_no_groups"),
+                main_menu_keyboard(call.from_user.id, lang),
+                call.message.message_id,
+            )
+            return
+        set_state(call.from_user.id, "await_broadcast_content")
+        send_or_edit(
+            call.message.chat.id,
+            t(lang, "broadcast_prompt"),
+            cancel_keyboard(lang),
             call.message.message_id,
         )
     elif action == "home":
@@ -268,6 +459,8 @@ def menu_actions(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("rm_page:"))
 def paginate_remove_bots(call):
     ensure_user(call.from_user.id)
+    if not require_admin(call.message):
+        return
     try:
         page = max(0, int(call.data.split(":", 1)[1]))
     except Exception:
@@ -279,6 +472,8 @@ def paginate_remove_bots(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("rm:"))
 def remove_bot(call):
     ensure_user(call.from_user.id)
+    if not require_admin(call.message):
+        return
     lang = current_lang(call.from_user.id)
     parts = call.data.split(":")
     if len(parts) != 3:
@@ -297,8 +492,17 @@ def remove_bot(call):
     show_remove_prompt(call.message.chat.id, call.from_user.id, page=page, message_id=call.message.message_id)
 
 
-@bot.message_handler(content_types=["text"])
-def text_router(message):
+@bot.callback_query_handler(func=lambda call: call.data == "cancel")
+def cancel(call):
+    ensure_user(call.from_user.id)
+    reset_pending(call.from_user.id)
+    lang = current_lang(call.from_user.id)
+    bot.answer_callback_query(call.id)
+    send_or_edit(call.message.chat.id, t(lang, "cancelled"), main_menu_keyboard(call.from_user.id, lang), call.message.message_id)
+
+
+@bot.message_handler(content_types=["text", "photo", "video", "document", "audio", "voice", "sticker", "animation"])
+def content_router(message):
     ensure_user(message.from_user.id)
     row = get_user(message.from_user.id)
     lang = current_lang(message.from_user.id)
@@ -307,7 +511,7 @@ def text_router(message):
         return
 
     if row["state"] == "await_bot_label":
-        if not message.text.strip() or message.text.startswith("/"):
+        if not getattr(message, "text", None) or message.text.startswith("/"):
             bot.reply_to(message, t(lang, "text_required"))
             return
         set_pending(
@@ -324,24 +528,25 @@ def text_router(message):
         return
 
     if row["state"] == "await_bot_token":
-        token = message.text.strip()
+        token = (message.text or "").strip()
         if not validate_bot_token(token):
             bot.reply_to(message, t(lang, "invalid_bot_token"))
             return
         label = (row["pending_bot_label"] or "Untitled bot").strip()[:100]
         add_bot_record(label=label, token=token, added_by=message.from_user.id)
         reset_pending(message.from_user.id)
-        bot.reply_to(message, t(lang, "bot_saved").format(label=label), reply_markup=main_menu_keyboard(lang))
+        bot.reply_to(message, t(lang, "bot_saved").format(label=label), reply_markup=main_menu_keyboard(message.from_user.id, lang))
         return
 
-
-@bot.callback_query_handler(func=lambda call: call.data == "cancel")
-def cancel(call):
-    ensure_user(call.from_user.id)
-    reset_pending(call.from_user.id)
-    lang = current_lang(call.from_user.id)
-    bot.answer_callback_query(call.id)
-    send_or_edit(call.message.chat.id, t(lang, "cancelled"), main_menu_keyboard(lang), call.message.message_id)
+    if row["state"] == "await_broadcast_content":
+        total, sent, failed = broadcast_message_to_groups(message.chat.id, message.message_id)
+        reset_pending(message.from_user.id)
+        bot.reply_to(
+            message,
+            t(lang, "broadcast_done").format(sent=sent, failed=failed),
+            reply_markup=main_menu_keyboard(message.from_user.id, lang),
+        )
+        return
 
 
 def configure_webhook():
@@ -362,8 +567,20 @@ def configure_webhook():
         log.exception("Failed to set webhook: %s", exc)
 
 
-init_db()
-configure_webhook()
+def init_runtime():
+    global BOT_ID
+    init_db()
+    try:
+        me = bot.get_me()
+        BOT_ID = int(me.id)
+        log.info("Bot ID: %s", BOT_ID)
+    except Exception as exc:
+        BOT_ID = None
+        log.warning("Could not resolve bot id: %s", exc)
+    configure_webhook()
+
+
+init_runtime()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
