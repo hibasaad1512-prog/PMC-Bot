@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 from urllib.parse import urlparse, unquote
 
@@ -47,6 +48,8 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=False)
 BOT_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
 
 BOT_ID: int | None = None
+BROADCAST_MAX_WORKERS = max(4, int(os.getenv("BROADCAST_MAX_WORKERS", "32")))
+BROADCAST_RETRY_SLEEP = float(os.getenv("BROADCAST_RETRY_SLEEP", "0.12"))
 
 
 def _get_attr_or_key(obj, name, default=None):
@@ -433,10 +436,29 @@ def _copy_or_forward_message(target_bot, chat_id: int, source_chat_id: int, sour
     target_bot.forward_message(chat_id=chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
 
 
+
+def _clean_kwargs(kwargs: dict):
+    return {key: value for key, value in kwargs.items() if value is not None}
+
+
+def _should_retry_api_exception(exc: Exception) -> bool:
+    code = getattr(exc, "error_code", None)
+    if code in (400, 401, 403, 404):
+        return False
+    if code == 429:
+        return True
+    description = str(exc).lower()
+    if "forbidden" in description or "bad request" in description:
+        return False
+    return True
+
+
+
 def extract_broadcast_payload(message):
     """
     Capture the incoming message in a bot-agnostic structure so follower bots
     can send it themselves, without needing access to the engine's private chat.
+    Supports the most common Telegram message types, including media and rich content.
     """
     content_type = getattr(message, "content_type", None) or (
         "text" if getattr(message, "text", None) else "unknown"
@@ -447,6 +469,33 @@ def extract_broadcast_payload(message):
         "text": None,
         "file_id": None,
         "caption": None,
+        "phone_number": None,
+        "first_name": None,
+        "last_name": None,
+        "vcard": None,
+        "latitude": None,
+        "longitude": None,
+        "live_period": None,
+        "horizontal_accuracy": None,
+        "heading": None,
+        "proximity_alert_radius": None,
+        "title": None,
+        "address": None,
+        "foursquare_id": None,
+        "foursquare_type": None,
+        "google_place_id": None,
+        "google_place_type": None,
+        "question": None,
+        "options": None,
+        "is_anonymous": None,
+        "poll_type": None,
+        "allows_multiple_answers": None,
+        "correct_option_id": None,
+        "explanation": None,
+        "open_period": None,
+        "close_date": None,
+        "is_closed": None,
+        "emoji": None,
     }
 
     if content_type == "text":
@@ -460,18 +509,73 @@ def extract_broadcast_payload(message):
         payload["caption"] = getattr(message, "caption", None)
         return payload
 
-    if content_type in {"video", "document", "audio", "voice", "animation", "sticker"}:
+    if content_type in {"video", "document", "audio", "voice", "animation", "sticker", "video_note"}:
         obj = getattr(message, content_type, None)
         if obj is not None:
             payload["file_id"] = getattr(obj, "file_id", None)
-        if content_type != "sticker":
+        if content_type not in {"sticker", "video_note"}:
             payload["caption"] = getattr(message, "caption", None)
         return payload
 
-    # Fallback for any unsupported type; we'll try to use text if present.
+    if content_type == "contact":
+        contact = getattr(message, "contact", None)
+        if contact is not None:
+            payload["phone_number"] = getattr(contact, "phone_number", None)
+            payload["first_name"] = getattr(contact, "first_name", None)
+            payload["last_name"] = getattr(contact, "last_name", None)
+            payload["vcard"] = getattr(contact, "vcard", None)
+        return payload
+
+    if content_type == "location":
+        location = getattr(message, "location", None)
+        if location is not None:
+            payload["latitude"] = getattr(location, "latitude", None)
+            payload["longitude"] = getattr(location, "longitude", None)
+            payload["live_period"] = getattr(location, "live_period", None)
+            payload["horizontal_accuracy"] = getattr(location, "horizontal_accuracy", None)
+            payload["heading"] = getattr(location, "heading", None)
+            payload["proximity_alert_radius"] = getattr(location, "proximity_alert_radius", None)
+        return payload
+
+    if content_type == "venue":
+        venue = getattr(message, "venue", None)
+        if venue is not None:
+            payload["latitude"] = getattr(venue, "location", None).latitude if getattr(venue, "location", None) else None
+            payload["longitude"] = getattr(venue, "location", None).longitude if getattr(venue, "location", None) else None
+            payload["title"] = getattr(venue, "title", None)
+            payload["address"] = getattr(venue, "address", None)
+            payload["foursquare_id"] = getattr(venue, "foursquare_id", None)
+            payload["foursquare_type"] = getattr(venue, "foursquare_type", None)
+            payload["google_place_id"] = getattr(venue, "google_place_id", None)
+            payload["google_place_type"] = getattr(venue, "google_place_type", None)
+        return payload
+
+    if content_type == "poll":
+        poll = getattr(message, "poll", None)
+        if poll is not None:
+            payload["question"] = getattr(poll, "question", None)
+            payload["options"] = [getattr(opt, "text", str(opt)) for opt in (getattr(poll, "options", None) or [])]
+            payload["is_anonymous"] = getattr(poll, "is_anonymous", None)
+            payload["poll_type"] = getattr(poll, "type", None)
+            payload["allows_multiple_answers"] = getattr(poll, "allows_multiple_answers", None)
+            payload["correct_option_id"] = getattr(poll, "correct_option_id", None)
+            payload["explanation"] = getattr(poll, "explanation", None)
+            payload["open_period"] = getattr(poll, "open_period", None)
+            payload["close_date"] = getattr(poll, "close_date", None)
+            payload["is_closed"] = getattr(poll, "is_closed", None)
+        return payload
+
+    if content_type == "dice":
+        dice = getattr(message, "dice", None)
+        if dice is not None:
+            payload["emoji"] = getattr(dice, "emoji", None)
+        return payload
+
+    # Fallback for unsupported types; we'll try to use text if present.
     payload["text"] = getattr(message, "text", None)
     payload["caption"] = getattr(message, "caption", None)
     return payload
+
 
 
 def send_payload_with_bot(target_bot, chat_id: int, payload: dict):
@@ -498,10 +602,76 @@ def send_payload_with_bot(target_bot, chat_id: int, payload: dict):
         return target_bot.send_animation(chat_id, file_id, caption=caption or None)
     if content_type == "sticker":
         return target_bot.send_sticker(chat_id, file_id)
+    if content_type == "video_note":
+        return target_bot.send_video_note(chat_id, file_id)
+
+    if content_type == "contact":
+        kwargs = _clean_kwargs(
+            {
+                "phone_number": payload.get("phone_number"),
+                "first_name": payload.get("first_name"),
+                "last_name": payload.get("last_name"),
+                "vcard": payload.get("vcard"),
+            }
+        )
+        return target_bot.send_contact(chat_id, **kwargs)
+
+    if content_type == "location":
+        kwargs = _clean_kwargs(
+            {
+                "latitude": payload.get("latitude"),
+                "longitude": payload.get("longitude"),
+                "live_period": payload.get("live_period"),
+                "horizontal_accuracy": payload.get("horizontal_accuracy"),
+                "heading": payload.get("heading"),
+                "proximity_alert_radius": payload.get("proximity_alert_radius"),
+            }
+        )
+        return target_bot.send_location(chat_id, **kwargs)
+
+    if content_type == "venue":
+        kwargs = _clean_kwargs(
+            {
+                "latitude": payload.get("latitude"),
+                "longitude": payload.get("longitude"),
+                "title": payload.get("title"),
+                "address": payload.get("address"),
+                "foursquare_id": payload.get("foursquare_id"),
+                "foursquare_type": payload.get("foursquare_type"),
+                "google_place_id": payload.get("google_place_id"),
+                "google_place_type": payload.get("google_place_type"),
+            }
+        )
+        return target_bot.send_venue(chat_id, **kwargs)
+
+    if content_type == "poll":
+        options = [opt for opt in (payload.get("options") or []) if opt]
+        if not payload.get("question") or len(options) < 2:
+            text = payload.get("text") or caption or "Unsupported poll payload."
+            return target_bot.send_message(chat_id, text)
+
+        kwargs = _clean_kwargs(
+            {
+                "is_anonymous": payload.get("is_anonymous"),
+                "type": payload.get("poll_type"),
+                "allows_multiple_answers": payload.get("allows_multiple_answers"),
+                "correct_option_id": payload.get("correct_option_id"),
+                "explanation": payload.get("explanation"),
+                "open_period": payload.get("open_period"),
+                "close_date": payload.get("close_date"),
+                "is_closed": payload.get("is_closed"),
+            }
+        )
+        return target_bot.send_poll(chat_id, payload["question"], options, **kwargs)
+
+    if content_type == "dice":
+        kwargs = _clean_kwargs({"emoji": payload.get("emoji")})
+        return target_bot.send_dice(chat_id, **kwargs)
 
     # Safe fallback: try plain text if available.
     text = payload.get("text") or caption or ""
     return target_bot.send_message(chat_id, text)
+
 
 
 def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: int = 0, target_group_id: int | None = None):
@@ -516,7 +686,8 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
     delay_seconds = max(0, int(delay_seconds or 0))
 
     if not groups or not managed_bots:
-        return len(groups) * len(managed_bots) * repeats, 0, len(groups) * len(managed_bots) * repeats
+        total = len(groups) * len(managed_bots) * repeats
+        return total, 0, total
 
     total = len(groups) * len(managed_bots) * repeats
     sent = 0
@@ -531,13 +702,24 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
                 return True, None
             except ApiTelegramException as exc:
                 last_exc = exc
+                error_code = getattr(exc, "error_code", None)
+                description = str(exc).lower()
+                # Fail fast for permanent errors.
+                if error_code in (400, 401, 403, 404) or "forbidden" in description or "bad request" in description:
+                    log.warning(
+                        "Permanent broadcast failure to %s using bot %s: %s",
+                        chat_id,
+                        bot_row["id"] if bot_row else "engine",
+                        exc,
+                    )
+                    return False, last_exc
                 log.warning(
-                    "Broadcast failed to %s using %s: %s",
+                    "Temporary broadcast failure to %s using bot %s: %s",
                     chat_id,
                     bot_row["id"] if bot_row else "engine",
                     exc,
                 )
-                time.sleep(0.25 * (attempt + 1))
+                time.sleep(BROADCAST_RETRY_SLEEP * (attempt + 1))
             except Exception as exc:
                 last_exc = exc
                 log.warning(
@@ -546,31 +728,37 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
                     bot_row["id"] if bot_row else "engine",
                     exc,
                 )
-                time.sleep(0.25 * (attempt + 1))
+                time.sleep(BROADCAST_RETRY_SLEEP * (attempt + 1))
         return False, last_exc
 
-    # A small thread pool gives us much better throughput while keeping the
-    # bot stable on Render Free.
-    max_workers = min(16, max(4, len(managed_bots) * 2))
-    for round_index in range(repeats):
-        futures = []
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    def _run_bot_worker(bot_row, target_bot):
+        local_sent = 0
+        local_failed = 0
+        for round_index in range(repeats):
             for group in groups:
                 chat_id = int(group["chat_id"])
-                for bot_row, target_bot in managed_bots:
-                    futures.append(executor.submit(_broadcast_one, target_bot, bot_row, chat_id))
-
-            for future in as_completed(futures):
-                ok, _err = future.result()
+                ok, _err = _broadcast_one(target_bot, bot_row, chat_id)
                 if ok:
-                    sent += 1
+                    local_sent += 1
                 else:
-                    failed += 1
+                    local_failed += 1
+            if round_index < repeats - 1 and delay_seconds:
+                time.sleep(delay_seconds)
+        return local_sent, local_failed
 
-        if round_index < repeats - 1 and delay_seconds:
-            time.sleep(delay_seconds)
+    # Parallelize by bot (not by every bot/group pair). This is usually faster,
+    # lowers pressure on Telegram rate limits, and keeps all follower bots working
+    # at the same time.
+    max_workers = min(BROADCAST_MAX_WORKERS, max(1, len(managed_bots)))
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_run_bot_worker, bot_row, target_bot) for bot_row, target_bot in managed_bots]
+        for future in as_completed(futures):
+            local_sent, local_failed = future.result()
+            sent += local_sent
+            failed += local_failed
 
     return total, sent, failed
 
@@ -1189,7 +1377,7 @@ def content_router(message):
         )
         bot.reply_to(
             message,
-            "📝 Send the message you want to broadcast now.\nIt will be sent by all saved bots to all registered groups.",
+            "📝 Send the message you want to broadcast now.\nIt will be sent by all saved bots to all registered groups.\n\nSupported: text, photo, video, GIF, document, sticker, voice, audio, video note, contact, location, venue, poll, and dice.",
             reply_markup=cancel_keyboard(lang),
         )
         return
