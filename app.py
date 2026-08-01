@@ -4,6 +4,7 @@ import re
 import time
 from typing import Optional
 from urllib.parse import urlparse, unquote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Flask, abort, request
 import telebot
@@ -385,56 +386,46 @@ def _copy_or_forward_message(target_bot, chat_id: int, source_chat_id: int, sour
     target_bot.forward_message(chat_id=chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
 
 
+
 def broadcast_message_to_groups(source_chat_id: int, source_message_id: int, repeats: int = 1, delay_seconds: int = 0):
     groups = list_groups(limit=10_000)
-    managed_bots = get_managed_bot_instances()
 
-    total = len(groups) * len(managed_bots) * max(1, repeats)
+    # Broadcast using the engine bot itself. Added bots are stored for the next phase,
+    # but they are not used for the current broadcast step.
+    total = len(groups) * max(1, int(repeats or 1))
     sent = 0
     failed = 0
 
     repeats = max(1, int(repeats or 1))
     delay_seconds = max(0, int(delay_seconds or 0))
 
+    def _send_once(chat_id: int):
+        last_exc = None
+        for attempt in range(3):
+            try:
+                _copy_or_forward_message(bot, chat_id, source_chat_id, source_message_id)
+                return True, None
+            except ApiTelegramException as exc:
+                last_exc = exc
+                log.warning("Broadcast failed to %s: %s", chat_id, exc)
+                time.sleep(0.2 * (attempt + 1))
+            except Exception as exc:
+                last_exc = exc
+                log.warning("Broadcast failed to %s: %s", chat_id, exc)
+                time.sleep(0.2 * (attempt + 1))
+        return False, last_exc
+
     for round_index in range(repeats):
-        for group in groups:
-            chat_id = int(group["chat_id"])
-            for bot_row, target_bot in managed_bots:
-                done = False
-                last_exc = None
-                for attempt in range(3):
-                    try:
-                        _copy_or_forward_message(target_bot, chat_id, source_chat_id, source_message_id)
-                        sent += 1
-                        done = True
-                        break
-                    except ApiTelegramException as exc:
-                        last_exc = exc
-                        log.warning(
-                            "Broadcast failed to %s using %s: %s",
-                            chat_id,
-                            bot_row["id"] if bot_row else "engine",
-                            exc,
-                        )
-                        time.sleep(0.2 * (attempt + 1))
-                    except Exception as exc:
-                        last_exc = exc
-                        log.warning(
-                            "Broadcast failed to %s using %s: %s",
-                            chat_id,
-                            bot_row["id"] if bot_row else "engine",
-                            exc,
-                        )
-                        time.sleep(0.2 * (attempt + 1))
-                if not done:
+        max_workers = min(5, max(1, len(groups)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_send_once, int(group["chat_id"])): int(group["chat_id"]) for group in groups}
+            for future in as_completed(futures):
+                ok, _exc = future.result()
+                if ok:
+                    sent += 1
+                else:
                     failed += 1
-                    if last_exc:
-                        log.debug(
-                            "Final broadcast error for %s using %s: %s",
-                            chat_id,
-                            bot_row["id"] if bot_row else "engine",
-                            last_exc,
-                        )
+
         if round_index < repeats - 1 and delay_seconds:
             time.sleep(delay_seconds)
 
@@ -610,9 +601,6 @@ def broadcast_cmd(message):
     if count_groups() <= 0:
         bot.reply_to(message, t(lang, "broadcast_no_groups"))
         return
-    if count_bots() <= 0:
-        bot.reply_to(message, "No follower bots are active yet. Add at least one bot first.")
-        return
     reset_pending(message.from_user.id)
     set_state(message.from_user.id, "await_broadcast_repeats")
     bot.reply_to(
@@ -764,14 +752,6 @@ def menu_actions(call):
             send_or_edit(
                 call.message.chat.id,
                 t(lang, "broadcast_no_groups"),
-                main_menu_keyboard(call.from_user.id, lang),
-                call.message.message_id,
-            )
-            return
-        if count_bots() <= 0:
-            send_or_edit(
-                call.message.chat.id,
-                "No follower bots are active yet. Add at least one bot first.",
                 main_menu_keyboard(call.from_user.id, lang),
                 call.message.message_id,
             )
