@@ -48,6 +48,14 @@ BOT_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
 BOT_ID: int | None = None
 
 
+def _get_attr_or_key(obj, name, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
 def current_lang(user_id: int) -> str:
     row = get_user(user_id)
     return row["language"] if row and row["language"] else "en"
@@ -235,12 +243,12 @@ def normalize_group_reference(raw_text: str) -> str:
 
 
 def _extract_forwarded_chat(message):
-    forward_chat = getattr(message, "forward_from_chat", None)
+    forward_chat = _get_attr_or_key(message, "forward_from_chat", None)
     if forward_chat is not None:
         return forward_chat
-    forward_origin = getattr(message, "forward_origin", None)
+    forward_origin = _get_attr_or_key(message, "forward_origin", None)
     if forward_origin is not None:
-        origin_chat = getattr(forward_origin, "chat", None) or getattr(forward_origin, "sender_chat", None)
+        origin_chat = _get_attr_or_key(forward_origin, "chat", None) or _get_attr_or_key(forward_origin, "sender_chat", None)
         if origin_chat is not None:
             return origin_chat
     return None
@@ -262,12 +270,12 @@ _BOT_INSTANCE_CACHE: dict[str, telebot.TeleBot] = {}
 
 
 def register_group_from_chat(chat, title: str | None = None):
-    resolved_title = title or chat.title or chat.first_name or chat.username or f"Group {chat.id}"
+    resolved_title = title or _get_attr_or_key(chat, "title") or _get_attr_or_key(chat, "first_name") or _get_attr_or_key(chat, "username") or f"Group {_get_attr_or_key(chat, 'id')}"
     upsert_group(
-        chat_id=int(chat.id),
+        chat_id=int(_get_attr_or_key(chat, "id")),
         title=resolved_title,
-        username=getattr(chat, "username", None),
-        chat_type=getattr(chat, "type", "group"),
+        username=_get_attr_or_key(chat, "username", None),
+        chat_type=_get_attr_or_key(chat, "type", "group"),
     )
 
 
@@ -314,11 +322,13 @@ def resolve_group_from_private_message(message):
     lookup = raw_text if raw_text.startswith("@") else f"@{raw_text}"
     if lookup.startswith("@@"):
         lookup = lookup[1:]
-    try:
-        chat = bot.get_chat(lookup)
-        return chat, None
-    except Exception:
-        pass
+    for bot_row, resolver_bot in get_group_resolver_bots():
+        try:
+            chat = resolver_bot.get_chat(lookup)
+            if chat is not None:
+                return chat, None
+        except Exception as exc:
+            log.debug("get_chat failed via %s for %s: %s", bot_row["id"] if bot_row else "engine", lookup, exc)
 
     # Search previously registered groups by title/username.
     matches = find_groups_by_query(raw_text.lstrip("@"))
@@ -344,7 +354,7 @@ def get_managed_bot_instances():
     bots = []
     for row in list_all_bots():
         token = (row["token"] or "").strip()
-        if not token:
+        if not token or token == BOT_TOKEN:
             continue
         cached = _BOT_INSTANCE_CACHE.get(token)
         if cached is None:
@@ -352,6 +362,19 @@ def get_managed_bot_instances():
             _BOT_INSTANCE_CACHE[token] = cached
         bots.append((row, cached))
     return bots
+
+
+def get_group_resolver_bots():
+    resolver_bots = []
+    seen_tokens = set()
+    for row, target_bot in get_managed_bot_instances():
+        token = (row["token"] or "").strip()
+        if token and token not in seen_tokens:
+            resolver_bots.append((row, target_bot))
+            seen_tokens.add(token)
+    if BOT_TOKEN and BOT_TOKEN not in seen_tokens:
+        resolver_bots.append((None, bot))
+    return resolver_bots
 
 
 def _copy_or_forward_message(target_bot, chat_id: int, source_chat_id: int, source_message_id: int):
@@ -365,8 +388,6 @@ def _copy_or_forward_message(target_bot, chat_id: int, source_chat_id: int, sour
 def broadcast_message_to_groups(source_chat_id: int, source_message_id: int, repeats: int = 1, delay_seconds: int = 0):
     groups = list_groups(limit=10_000)
     managed_bots = get_managed_bot_instances()
-    if not managed_bots:
-        managed_bots = [(None, bot)]
 
     total = len(groups) * len(managed_bots) * max(1, repeats)
     sent = 0
@@ -568,6 +589,9 @@ def broadcast_cmd(message):
     if count_groups() <= 0:
         bot.reply_to(message, t(lang, "broadcast_no_groups"))
         return
+    if count_bots() <= 0:
+        bot.reply_to(message, "No follower bots are active yet. Add at least one bot first.")
+        return
     reset_pending(message.from_user.id)
     set_state(message.from_user.id, "await_broadcast_repeats")
     bot.reply_to(
@@ -608,7 +632,7 @@ def register_cmd(message):
             else:
                 bot.reply_to(
                     message,
-                    "I could not resolve that group. Send a forwarded message from the group, its @username, a t.me link, or its numeric chat ID.",
+                    "I could not resolve that group. Send a forwarded message from the group, its @username, a t.me link, or its numeric chat ID. I will also try the saved follower bots if the engine cannot resolve it.",
                 )
             return
 
@@ -719,6 +743,14 @@ def menu_actions(call):
             send_or_edit(
                 call.message.chat.id,
                 t(lang, "broadcast_no_groups"),
+                main_menu_keyboard(call.from_user.id, lang),
+                call.message.message_id,
+            )
+            return
+        if count_bots() <= 0:
+            send_or_edit(
+                call.message.chat.id,
+                "No follower bots are active yet. Add at least one bot first.",
                 main_menu_keyboard(call.from_user.id, lang),
                 call.message.message_id,
             )
@@ -848,6 +880,9 @@ def content_router(message):
         if not validate_bot_token(token):
             bot.reply_to(message, t(lang, "invalid_bot_token"))
             return
+        if token == BOT_TOKEN:
+            bot.reply_to(message, "Please add a follower bot token, not the engine bot token.")
+            return
         label = (row["pending_bot_label"] or "Untitled bot").strip()[:100]
         add_bot_record(label=label, token=token, added_by=message.from_user.id)
         reset_pending(message.from_user.id)
@@ -870,7 +905,7 @@ def content_router(message):
             else:
                 bot.reply_to(
                     message,
-                    "I could not resolve that group. Send a forwarded message from the group, its @username, a t.me link, or its numeric chat ID.",
+                    "I could not resolve that group. Send a forwarded message from the group, its @username, a t.me link, or its numeric chat ID. I will also try the saved follower bots if the engine cannot resolve it.",
                     reply_markup=cancel_keyboard(lang),
                 )
             return
