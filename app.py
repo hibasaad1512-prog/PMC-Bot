@@ -510,7 +510,7 @@ def get_group_resolver_bots():
 def get_broadcast_worker_bots():
     """
     Returns the stored follower bots that should actually deliver broadcasts.
-    The engine bot is only used as a last fallback when no follower bots exist.
+    The engine bot is not used as a delivery fallback.
     """
     workers = []
     seen_tokens = set()
@@ -528,25 +528,28 @@ def get_broadcast_worker_bots():
         workers.append((row, cached))
         seen_tokens.add(token)
 
-    if not workers and BOT_TOKEN:
-        workers.append((None, bot))
-
     return workers
 
 
 def _prepare_broadcast_media(payload: dict):
     """
-    Download media once from the engine bot so every follower bot can reuse it.
-    This avoids relying on cross-bot file_id compatibility and is much more
-    reliable for photos, GIFs, voice notes, stickers, and documents.
+    Download media once from the engine bot so every stored bot can reuse it.
+    The payload becomes bot-agnostic: text stays text, and file-based media is
+    cached to a temporary local file that each stored bot uploads from its own
+    token/session.
     """
     content_type = payload.get("type") or "text"
     file_id = payload.get("file_id")
+
     if content_type not in BROADCAST_MEDIA_TYPES or not file_id:
         return payload
 
-    if payload.get("local_path"):
+    existing_path = payload.get("local_path")
+    if existing_path and os.path.exists(existing_path):
         return payload
+
+    if existing_path and not os.path.exists(existing_path):
+        payload.pop("local_path", None)
 
     try:
         file_info = bot.get_file(file_id)
@@ -563,7 +566,12 @@ def _prepare_broadcast_media(payload: dict):
 
         payload["local_path"] = tmp.name
     except Exception as exc:
-        log.warning("Could not cache broadcast media (%s): %s", content_type, exc)
+        log.warning(
+            "Could not cache broadcast media for content_type=%s message_id=%s: %s",
+            content_type,
+            payload.get("source_message_id"),
+            exc,
+        )
 
     return payload
 
@@ -572,6 +580,7 @@ def _cleanup_broadcast_media(payload: dict):
     local_path = payload.get("local_path")
     if not local_path:
         return
+
     try:
         if os.path.exists(local_path):
             os.unlink(local_path)
@@ -586,21 +595,43 @@ def _bot_name(bot_row):
         return "engine"
     label = (bot_row["label"] or "").strip()
     return f"{bot_row['id']}:{label}" if label else f"{bot_row['id']}"
-def _copy_or_forward_message(target_bot, chat_id: int, source_chat_id: int, source_message_id: int):
-    copier = getattr(target_bot, "copy_message", None)
-    if callable(copier):
-        copier(chat_id=chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
-        return
-    target_bot.forward_message(chat_id=chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
+
+
+def _telegram_error_details(exc):
+    status_code = _get_attr_or_key(exc, "error_code", None)
+    description = _get_attr_or_key(exc, "description", None)
+    retry_after = extract_retry_after(exc)
+
+    result_json = _get_attr_or_key(exc, "result_json", None)
+    if isinstance(result_json, dict):
+        status_code = result_json.get("error_code", status_code)
+        description = result_json.get("description", description)
+        params = result_json.get("parameters") or {}
+        retry_after = params.get("retry_after", retry_after) if isinstance(params, dict) else retry_after
+
+    if not description:
+        description = str(exc or "").strip() or exc.__class__.__name__
+
+    return status_code, description, retry_after
+
+
+def _format_telegram_error(exc):
+    status_code, description, retry_after = _telegram_error_details(exc)
+    parts = []
+    if status_code is not None:
+        parts.append(str(status_code))
+    if description:
+        parts.append(description)
+    if retry_after:
+        parts.append(f"retry_after={retry_after}s")
+    return " | ".join(parts) if parts else exc.__class__.__name__
 
 
 def extract_broadcast_payload(message):
     """
-    Capture the incoming message in a bot-agnostic structure so follower bots
-    can send it themselves, without needing access to the engine's private chat.
-    When possible, we also keep the original source chat/message ids so the
-    engine bot can copy the message directly. That is much faster and supports
-    almost every Telegram message type.
+    Capture the incoming message in a bot-agnostic structure so stored bots can
+    deliver it themselves, without depending on the engine bot's private chat or
+    any cross-bot copy/forward operation.
     """
     content_type = getattr(message, "content_type", None) or (
         "text" if getattr(message, "text", None) else "unknown"
@@ -631,180 +662,192 @@ def extract_broadcast_payload(message):
         payload["caption"] = getattr(message, "caption", None)
         return payload
 
-    if content_type in {"video", "document", "audio", "voice", "animation", "sticker", "video_note", "contact", "location", "venue", "dice", "poll"}:
+    if content_type in BROADCAST_MEDIA_TYPES:
         obj = getattr(message, content_type, None)
-        if obj is not None and content_type not in {"contact", "location", "venue", "dice", "poll"}:
+        if obj is not None:
             payload["file_id"] = getattr(obj, "file_id", None)
-        else:
-            payload[content_type] = obj
-        if content_type == "contact":
-            payload["contact"] = obj
-        elif content_type == "location":
-            payload["location"] = obj
-        elif content_type == "venue":
-            payload["venue"] = obj
-        elif content_type == "dice":
-            payload["dice"] = obj
-        elif content_type == "poll":
-            payload["poll"] = obj
-        if content_type != "sticker":
-            payload["caption"] = getattr(message, "caption", None)
+        payload["caption"] = getattr(message, "caption", None)
         return payload
 
-    # Fallback for any unsupported type; the source ids still let copy_message
-    # do the heavy lifting on the engine bot.
+    if content_type == "contact":
+        contact = getattr(message, "contact", None)
+        if contact is not None:
+            payload["contact"] = {
+                "phone_number": getattr(contact, "phone_number", ""),
+                "first_name": getattr(contact, "first_name", "Contact"),
+                "last_name": getattr(contact, "last_name", None),
+                "vcard": getattr(contact, "vcard", None),
+            }
+        return payload
+
+    if content_type == "location":
+        location = getattr(message, "location", None)
+        if location is not None:
+            payload["location"] = {
+                "latitude": getattr(location, "latitude", 0.0),
+                "longitude": getattr(location, "longitude", 0.0),
+            }
+        return payload
+
+    if content_type == "venue":
+        venue = getattr(message, "venue", None)
+        if venue is not None:
+            venue_location = getattr(venue, "location", None)
+            payload["venue"] = {
+                "title": getattr(venue, "title", "Venue"),
+                "address": getattr(venue, "address", ""),
+                "latitude": getattr(venue_location, "latitude", 0.0) if venue_location else 0.0,
+                "longitude": getattr(venue_location, "longitude", 0.0) if venue_location else 0.0,
+                "foursquare_id": getattr(venue, "foursquare_id", None),
+                "foursquare_type": getattr(venue, "foursquare_type", None),
+            }
+        return payload
+
+    if content_type == "dice":
+        dice = getattr(message, "dice", None)
+        if dice is not None:
+            payload["dice"] = {"emoji": getattr(dice, "emoji", None) or "🎲"}
+        return payload
+
+    if content_type == "poll":
+        poll = getattr(message, "poll", None)
+        if poll is not None:
+            payload["poll"] = {
+                "question": getattr(poll, "question", None),
+                "options": [getattr(opt, "text", str(opt)) for opt in (getattr(poll, "options", []) or [])],
+                "is_anonymous": getattr(poll, "is_anonymous", True),
+                "type": getattr(poll, "type", "regular"),
+                "allows_multiple_answers": getattr(poll, "allows_multiple_answers", False),
+                "correct_option_id": getattr(poll, "correct_option_id", None),
+                "explanation": getattr(poll, "explanation", None),
+                "open_period": getattr(poll, "open_period", None),
+                "close_date": getattr(poll, "close_date", None),
+            }
+        return payload
+
+    # Safe fallback for anything unexpected: preserve any text/caption we can.
     payload["text"] = getattr(message, "text", None)
     payload["caption"] = getattr(message, "caption", None)
     return payload
 
 
-def send_payload_with_bot(target_bot, chat_id: int, payload: dict):
+def _send_prepared_payload(target_bot, chat_id: int, payload: dict):
     content_type = payload.get("type") or "text"
     caption = payload.get("caption")
-    file_id = payload.get("file_id")
     local_path = payload.get("local_path")
 
-    # Best-effort copy for the engine bot only. Follower bots should send the
-    # payload directly so broadcasts do not depend on the engine's private chat.
-    if target_bot is bot:
-        source_chat_id = payload.get("source_chat_id")
-        source_message_id = payload.get("source_message_id")
-        copier = getattr(target_bot, "copy_message", None)
-        if callable(copier) and source_chat_id is not None and source_message_id is not None:
-            try:
-                return copier(
-                    chat_id=chat_id,
-                    from_chat_id=source_chat_id,
-                    message_id=source_message_id,
-                )
-            except Exception:
-                pass
+    def _send_from_path(send_func, **kwargs):
+        if not local_path:
+            raise RuntimeError(f"Prepared media is missing for content_type={content_type}")
+        if not os.path.exists(local_path):
+            raise RuntimeError(f"Prepared media file was not found: {local_path}")
+        with open(local_path, "rb") as fh:
+            return send_func(chat_id, fh, **kwargs)
 
     if content_type == "text":
-        text = payload.get("text") or ""
-        return target_bot.send_message(chat_id, text)
-
-    def _send_local_file(send_func, *args, **kwargs):
-        if local_path and os.path.exists(local_path):
-            with open(local_path, "rb") as fh:
-                return send_func(chat_id, fh, *args, **kwargs)
-        return None
+        return target_bot.send_message(chat_id, payload.get("text") or "")
 
     if content_type == "photo":
-        sent = _send_local_file(target_bot.send_photo, caption=caption or None)
-        if sent is not None:
-            return sent
-        if file_id:
-            return target_bot.send_photo(chat_id, file_id, caption=caption or None)
-        return target_bot.send_message(chat_id, caption or "")
-    if content_type == "video":
-        sent = _send_local_file(target_bot.send_video, caption=caption or None)
-        if sent is not None:
-            return sent
-        if file_id:
-            return target_bot.send_video(chat_id, file_id, caption=caption or None)
-        return target_bot.send_message(chat_id, caption or "")
-    if content_type == "document":
-        sent = _send_local_file(target_bot.send_document, caption=caption or None)
-        if sent is not None:
-            return sent
-        if file_id:
-            return target_bot.send_document(chat_id, file_id, caption=caption or None)
-        return target_bot.send_message(chat_id, caption or "")
-    if content_type == "audio":
-        sent = _send_local_file(target_bot.send_audio, caption=caption or None)
-        if sent is not None:
-            return sent
-        if file_id:
-            return target_bot.send_audio(chat_id, file_id, caption=caption or None)
-        return target_bot.send_message(chat_id, caption or "")
-    if content_type == "voice":
-        sent = _send_local_file(target_bot.send_voice, caption=caption or None)
-        if sent is not None:
-            return sent
-        if file_id:
-            return target_bot.send_voice(chat_id, file_id, caption=caption or None)
-        return target_bot.send_message(chat_id, caption or "")
-    if content_type == "animation":
-        sent = _send_local_file(target_bot.send_animation, caption=caption or None)
-        if sent is not None:
-            return sent
-        if file_id:
-            return target_bot.send_animation(chat_id, file_id, caption=caption or None)
-        return target_bot.send_message(chat_id, caption or "")
-    if content_type == "video_note":
-        sent = _send_local_file(target_bot.send_video_note)
-        if sent is not None:
-            return sent
-        if file_id:
-            return target_bot.send_video_note(chat_id, file_id)
-        return target_bot.send_message(chat_id, "🎥 Video note")
-    if content_type == "sticker":
-        sent = _send_local_file(target_bot.send_sticker)
-        if sent is not None:
-            return sent
-        if file_id:
-            return target_bot.send_sticker(chat_id, file_id)
-        return target_bot.send_message(chat_id, "🙂 Sticker")
-    if content_type == "contact":
-        contact = payload.get("contact")
-        if contact is not None:
-            return target_bot.send_contact(
-                chat_id,
-                phone_number=getattr(contact, "phone_number", ""),
-                first_name=getattr(contact, "first_name", "Contact"),
-                last_name=getattr(contact, "last_name", None),
-                vcard=getattr(contact, "vcard", None),
-            )
-    if content_type == "location":
-        location = payload.get("location")
-        if location is not None:
-            return target_bot.send_location(
-                chat_id,
-                latitude=getattr(location, "latitude", 0.0),
-                longitude=getattr(location, "longitude", 0.0),
-            )
-    if content_type == "venue":
-        venue = payload.get("venue")
-        if venue is not None:
-            venue_location = getattr(venue, "location", None)
-            return target_bot.send_venue(
-                chat_id,
-                latitude=venue_location.latitude if venue_location else 0.0,
-                longitude=venue_location.longitude if venue_location else 0.0,
-                title=getattr(venue, "title", "Venue"),
-                address=getattr(venue, "address", ""),
-                foursquare_id=getattr(venue, "foursquare_id", None),
-                foursquare_type=getattr(venue, "foursquare_type", None),
-            )
-    if content_type == "dice":
-        dice = payload.get("dice")
-        if dice is not None:
-            return target_bot.send_dice(chat_id, emoji=getattr(dice, "emoji", None) or "🎲")
-    if content_type == "poll":
-        poll = payload.get("poll")
-        question = getattr(poll, "question", None) if poll is not None else None
-        options = []
-        if poll is not None:
-            for opt in getattr(poll, "options", []) or []:
-                options.append(getattr(opt, "text", str(opt)))
-        if question and options:
-            try:
-                return target_bot.send_poll(
-                    chat_id,
-                    question,
-                    options,
-                    is_anonymous=getattr(poll, "is_anonymous", True),
-                    type=getattr(poll, "type", "regular"),
-                    allows_multiple_answers=getattr(poll, "allows_multiple_answers", False),
-                )
-            except Exception:
-                pass
-        return target_bot.send_message(chat_id, question or payload.get("text") or caption or "Poll")
+        return _send_from_path(target_bot.send_photo, caption=caption or None)
 
-    # Safe fallback: try plain text if available.
+    if content_type == "video":
+        return _send_from_path(target_bot.send_video, caption=caption or None)
+
+    if content_type == "document":
+        return _send_from_path(target_bot.send_document, caption=caption or None)
+
+    if content_type == "audio":
+        return _send_from_path(target_bot.send_audio, caption=caption or None)
+
+    if content_type == "voice":
+        return _send_from_path(target_bot.send_voice, caption=caption or None)
+
+    if content_type == "animation":
+        return _send_from_path(target_bot.send_animation, caption=caption or None)
+
+    if content_type == "video_note":
+        return _send_from_path(target_bot.send_video_note)
+
+    if content_type == "sticker":
+        return _send_from_path(target_bot.send_sticker)
+
+    if content_type == "contact":
+        contact = payload.get("contact") or {}
+        return target_bot.send_contact(
+            chat_id,
+            phone_number=contact.get("phone_number", ""),
+            first_name=contact.get("first_name", "Contact"),
+            last_name=contact.get("last_name", None),
+            vcard=contact.get("vcard", None),
+        )
+
+    if content_type == "location":
+        location = payload.get("location") or {}
+        return target_bot.send_location(
+            chat_id,
+            latitude=location.get("latitude", 0.0),
+            longitude=location.get("longitude", 0.0),
+        )
+
+    if content_type == "venue":
+        venue = payload.get("venue") or {}
+        return target_bot.send_venue(
+            chat_id,
+            latitude=venue.get("latitude", 0.0),
+            longitude=venue.get("longitude", 0.0),
+            title=venue.get("title", "Venue"),
+            address=venue.get("address", ""),
+            foursquare_id=venue.get("foursquare_id", None),
+            foursquare_type=venue.get("foursquare_type", None),
+        )
+
+    if content_type == "dice":
+        dice = payload.get("dice") or {}
+        return target_bot.send_dice(chat_id, emoji=dice.get("emoji") or "🎲")
+
+    if content_type == "poll":
+        poll = payload.get("poll") or {}
+        options = poll.get("options") or []
+        question = poll.get("question") or payload.get("text") or caption or "Poll"
+        if options:
+            try:
+                kwargs = {
+                    "is_anonymous": poll.get("is_anonymous", True),
+                    "type": poll.get("type", "regular"),
+                    "allows_multiple_answers": poll.get("allows_multiple_answers", False),
+                }
+                for key in ("correct_option_id", "explanation", "open_period", "close_date"):
+                    value = poll.get(key, None)
+                    if value is not None:
+                        kwargs[key] = value
+                return target_bot.send_poll(chat_id, question, options, **kwargs)
+            except Exception:
+                log.debug("send_poll failed for chat_id=%s; falling back to text", chat_id, exc_info=True)
+        return target_bot.send_message(chat_id, question)
+
     text = payload.get("text") or caption or ""
     return target_bot.send_message(chat_id, text)
+
+
+def send_payload_with_bot(target_bot, chat_id: int, payload: dict):
+    """
+    Send a prepared broadcast payload using the supplied bot instance only.
+    No copy_message / forward_message is used here.
+    """
+    return _send_prepared_payload(target_bot, chat_id, payload)
+
+
+def _log_broadcast_failure(bot_row, chat_id: int, payload: dict, exc: Exception, phase: str):
+    bot_name = _bot_name(bot_row)
+    error_text = _format_telegram_error(exc)
+    log.warning(
+        "%s failed bot=%s chat_id=%s type=%s error=%s",
+        phase,
+        bot_name,
+        chat_id,
+        payload.get("type") or "text",
+        error_text,
+    )
 
 
 def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: int = 0, target_group_id: int | None = None):
@@ -822,7 +865,8 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
 
     workers = get_broadcast_worker_bots()
     if not workers:
-        return 0, 0, 0
+        log.warning("Broadcast skipped: no stored bots are available.")
+        return len(groups) * repeats, 0, len(groups) * repeats
 
     payload = _prepare_broadcast_media(dict(payload))
 
@@ -845,16 +889,15 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
                     return True, None
                 except ApiTelegramException as exc:
                     last_exc = exc
-                    err_text = str(exc).lower()
-                    # If this looks temporary, retry once quickly; otherwise move
-                    # on to the next worker bot.
-                    if "retry after" in err_text or "too many requests" in err_text:
-                        time.sleep(0.12 * (attempt + 1))
+                    _log_broadcast_failure(bot_row, chat_id, payload, exc, phase="broadcast")
+                    status_code, _description, retry_after = _telegram_error_details(exc)
+                    if retry_after > 0 or status_code == 429:
+                        time.sleep(min(max(retry_after, 1), 60) + (0.12 * attempt))
                         continue
                     break
                 except Exception as exc:
                     last_exc = exc
-                    time.sleep(0.05 * (attempt + 1))
+                    _log_broadcast_failure(bot_row, chat_id, payload, exc, phase="broadcast")
                     break
 
         return False, last_exc
@@ -886,28 +929,28 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
     return total, sent, failed
 
 
-def _send_payload_with_retry(target_bot, chat_id: int, payload: dict, max_attempts: int = 3):
+def _send_payload_with_retry(bot_row, target_bot, chat_id: int, payload: dict, phase: str = "loopbroadcast", max_attempts: int = 3):
     last_exc = None
     for attempt in range(max_attempts):
         try:
             return True, send_payload_with_bot(target_bot, chat_id, payload)
         except ApiTelegramException as exc:
             last_exc = exc
-            retry_after = extract_retry_after(exc)
-            desc = str(exc or "").lower()
-            if retry_after > 0:
-                time.sleep(min(retry_after, 60) + 1)
+            status_code, _description, retry_after = _telegram_error_details(exc)
+            if retry_after > 0 or status_code == 429:
+                time.sleep(min(max(retry_after, 1), 60) + (0.15 * attempt))
                 continue
-            if "too many requests" in desc or "retry after" in desc:
-                time.sleep(1.5 * (attempt + 1))
-                continue
+            _log_broadcast_failure(bot_row, chat_id, payload, exc, phase=phase)
             return False, exc
         except Exception as exc:
             last_exc = exc
             if attempt < max_attempts - 1:
                 time.sleep(0.35 * (attempt + 1))
                 continue
+            _log_broadcast_failure(bot_row, chat_id, payload, exc, phase=phase)
             return False, exc
+    if last_exc is not None:
+        _log_broadcast_failure(bot_row, chat_id, payload, last_exc, phase=phase)
     return False, last_exc
 
 
@@ -972,7 +1015,7 @@ def _run_loop_broadcast_job(owner_user_id: int):
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 for index in range(batch_size):
                     worker_row, worker_bot = workers[(round_no - 1 + index) % workers_count]
-                    futures.append(executor.submit(_send_payload_with_retry, worker_bot, target_group_id, payload))
+                    futures.append(executor.submit(_send_payload_with_retry, worker_row, worker_bot, target_group_id, payload, "loopbroadcast"))
 
                 for future in as_completed(futures):
                     ok, _result = future.result()
@@ -1708,7 +1751,7 @@ def content_router(message):
         )
         bot.reply_to(
             message,
-            "📝 Send the message you want to broadcast now.\nIt will be copied exactly and sent faster.",
+            "📝 Send the message you want to broadcast now.\nIt will be prepared once and sent through the stored bots.",
             reply_markup=cancel_keyboard(lang),
         )
         return
