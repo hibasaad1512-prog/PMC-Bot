@@ -4,7 +4,6 @@ import re
 import time
 import tempfile
 import threading
-import uuid
 from typing import Optional
 from urllib.parse import urlparse, unquote
 
@@ -51,11 +50,6 @@ BOT_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
 
 BOT_ID: int | None = None
 
-BROADCAST_BATCH_SIZE = 10
-BROADCAST_CHUNK_PAUSE = 0.35
-ACTIVE_BROADCASTS: dict[int, dict] = {}
-ACTIVE_BROADCASTS_LOCK = threading.Lock()
-
 SUPPORTED_BROADCAST_CONTENT_TYPES = [
     "text",
     "photo",
@@ -95,12 +89,44 @@ BROADCAST_MEDIA_SUFFIXES = {
     "sticker": ".webp",
     "video_note": ".mp4",
 }
+
+ACTIVE_LOOP_JOBS: dict[int, dict] = {}
+ACTIVE_LOOP_JOBS_LOCK = threading.RLock()
+LOOP_MAX_INTERVAL_SECONDS = 300  # 5 minutes
+
+
+def is_command_message(message) -> bool:
+    text = getattr(message, "text", None)
+    return bool(text and text.lstrip().startswith("/"))
+
+
 def _get_attr_or_key(obj, name, default=None):
     if obj is None:
         return default
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+
+def extract_retry_after(exc) -> int:
+    try:
+        data = getattr(exc, "result_json", None)
+        if isinstance(data, dict):
+            params = data.get("parameters") or {}
+            retry_after = params.get("retry_after")
+            if isinstance(retry_after, int) and retry_after > 0:
+                return retry_after
+    except Exception:
+        pass
+
+    desc = str(exc or "")
+    m = re.search(r"retry after\s+(\d+)", desc, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return 0
+    return 0
 
 
 def current_lang(user_id: int) -> str:
@@ -150,6 +176,15 @@ def main_menu_keyboard(user_id: int, lang: str | None = None):
 def cancel_keyboard(lang: str | None = None):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton(t(lang or "en", "cancel"), callback_data="cancel"))
+    return kb
+
+
+def loop_status_keyboard(lang: str | None = None):
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("🛑 Stop", callback_data="loopstop"),
+        InlineKeyboardButton(t(lang or "en", "cancel"), callback_data="cancel"),
+    )
     return kb
 
 
@@ -546,99 +581,6 @@ def _cleanup_broadcast_media(payload: dict):
         payload.pop("local_path", None)
 
 
-def _extract_retry_after_seconds(exc) -> float:
-    text = str(exc)
-    match = re.search(r"retry after\s*(\d+(?:\.\d+)?)", text, flags=re.IGNORECASE)
-    if match:
-        try:
-            return max(0.0, float(match.group(1)))
-        except Exception:
-            return 0.0
-    return 0.0
-
-
-def _broadcast_job_key(user_id: int) -> int:
-    return int(user_id)
-
-
-def get_active_broadcast_job(user_id: int):
-    with ACTIVE_BROADCASTS_LOCK:
-        return ACTIVE_BROADCASTS.get(_broadcast_job_key(user_id))
-
-
-def has_active_broadcast(user_id: int) -> bool:
-    return get_active_broadcast_job(user_id) is not None
-
-
-def stop_active_broadcast(user_id: int) -> bool:
-    job = get_active_broadcast_job(user_id)
-    if not job:
-        return False
-    job["stop_event"].set()
-    return True
-
-
-def _clear_active_broadcast(user_id: int, job_id: str | None = None):
-    with ACTIVE_BROADCASTS_LOCK:
-        current = ACTIVE_BROADCASTS.get(_broadcast_job_key(user_id))
-        if not current:
-            return
-        if job_id is not None and current.get("job_id") != job_id:
-            return
-        ACTIVE_BROADCASTS.pop(_broadcast_job_key(user_id), None)
-
-
-def _store_active_broadcast(job: dict):
-    with ACTIVE_BROADCASTS_LOCK:
-        ACTIVE_BROADCASTS[_broadcast_job_key(job["user_id"])] = job
-
-
-def start_background_broadcast(user_id: int, chat_id: int, lang: str, payload: dict, repeats: int, delay_seconds: int, target_group_id: int | None):
-    job_id = uuid.uuid4().hex[:12]
-    stop_event = threading.Event()
-    job = {
-        "job_id": job_id,
-        "user_id": int(user_id),
-        "chat_id": int(chat_id),
-        "lang": lang if lang in ("en", "he", "sr") else "en",
-        "stop_event": stop_event,
-        "started_at": time.time(),
-    }
-    _store_active_broadcast(job)
-
-    def _worker():
-        result_text = None
-        try:
-            total, sent, failed = broadcast_message_to_groups(
-                payload,
-                repeats=repeats,
-                delay_seconds=delay_seconds,
-                target_group_id=target_group_id,
-                stop_event=stop_event,
-                batch_size=BROADCAST_BATCH_SIZE,
-            )
-            if stop_event.is_set():
-                result_text = t(job["lang"], "broadcast_stopped")
-                result_text += f"\nSent: {sent}\nFailed: {failed}"
-            else:
-                result_text = t(job["lang"], "broadcast_done").format(sent=sent, failed=failed)
-        except Exception as exc:
-            log.exception("Background broadcast crashed for user %s", user_id)
-            result_text = f"⚠️ Broadcast failed unexpectedly.\n{exc}"
-        finally:
-            _clear_active_broadcast(user_id, job_id)
-
-        try:
-            bot.send_message(job["chat_id"], result_text, reply_markup=main_menu_keyboard(job["user_id"], job["lang"]))
-        except Exception as exc:
-            log.warning("Could not send broadcast completion notice: %s", exc)
-
-    thread = threading.Thread(target=_worker, name=f"broadcast-{job_id}", daemon=True)
-    job["thread"] = thread
-    thread.start()
-    return job
-
-
 def _bot_name(bot_row):
     if not bot_row:
         return "engine"
@@ -865,14 +807,7 @@ def send_payload_with_bot(target_bot, chat_id: int, payload: dict):
     return target_bot.send_message(chat_id, text)
 
 
-def broadcast_message_to_groups(
-    payload: dict,
-    repeats: int = 1,
-    delay_seconds: int = 0,
-    target_group_id: int | None = None,
-    stop_event: threading.Event | None = None,
-    batch_size: int = BROADCAST_BATCH_SIZE,
-):
+def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: int = 0, target_group_id: int | None = None):
     if target_group_id is None:
         groups = list_groups(limit=10_000)
     else:
@@ -881,7 +816,6 @@ def broadcast_message_to_groups(
 
     repeats = max(1, int(repeats or 1))
     delay_seconds = max(0, int(delay_seconds or 0))
-    batch_size = max(1, int(batch_size or 1))
 
     if not groups:
         return 0, 0, 0
@@ -905,49 +839,35 @@ def broadcast_message_to_groups(
         ordered_workers = workers[rotation:] + workers[:rotation]
 
         for bot_row, target_bot in ordered_workers:
-            if stop_event and stop_event.is_set():
-                return False, RuntimeError("broadcast stopped")
-            for attempt in range(3):
+            for attempt in range(2):
                 try:
                     send_payload_with_bot(target_bot, chat_id, payload)
                     return True, None
                 except ApiTelegramException as exc:
                     last_exc = exc
                     err_text = str(exc).lower()
-                    retry_after = _extract_retry_after_seconds(exc)
-                    if retry_after > 0:
-                        time.sleep(min(retry_after, 5.0))
-                        continue
-                    if "retry after" in err_text or "too many requests" in err_text or "flood" in err_text:
-                        time.sleep(min(0.4 * (attempt + 1), 2.0))
-                        continue
-                    if "bad gateway" in err_text or "timeout" in err_text or "server error" in err_text:
-                        time.sleep(min(0.2 * (attempt + 1), 1.0))
+                    # If this looks temporary, retry once quickly; otherwise move
+                    # on to the next worker bot.
+                    if "retry after" in err_text or "too many requests" in err_text:
+                        time.sleep(0.12 * (attempt + 1))
                         continue
                     break
                 except Exception as exc:
                     last_exc = exc
-                    time.sleep(min(0.15 * (attempt + 1), 1.0))
-                    continue
+                    time.sleep(0.05 * (attempt + 1))
+                    break
 
         return False, last_exc
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # For multiple groups, we keep concurrency moderate. For a single selected
-    # group with many repeats, the outer batching below controls the pace.
-    max_workers = min(24, max(2, len(groups)))
+    max_workers = min(32, max(8, len(groups)))
 
     try:
         for round_index in range(repeats):
-            if stop_event and stop_event.is_set():
-                break
-
             futures = []
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 for group_index, group in enumerate(groups):
-                    if stop_event and stop_event.is_set():
-                        break
                     chat_id = int(group["chat_id"])
                     futures.append(executor.submit(_broadcast_one, group_index + round_index, chat_id))
 
@@ -958,18 +878,180 @@ def broadcast_message_to_groups(
                     else:
                         failed += 1
 
-            # Chunked pacing: after every batch of N rounds, pause briefly to
-            # keep delivery stable under Telegram's rate limits.
-            if stop_event and stop_event.is_set():
-                break
-            if (round_index + 1) % batch_size == 0 and round_index < repeats - 1:
-                time.sleep(max(0.15, delay_seconds or BROADCAST_CHUNK_PAUSE))
-            elif delay_seconds and round_index < repeats - 1:
+            if round_index < repeats - 1 and delay_seconds:
                 time.sleep(delay_seconds)
     finally:
         _cleanup_broadcast_media(payload)
 
     return total, sent, failed
+
+
+def _send_payload_with_retry(target_bot, chat_id: int, payload: dict, max_attempts: int = 3):
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return True, send_payload_with_bot(target_bot, chat_id, payload)
+        except ApiTelegramException as exc:
+            last_exc = exc
+            retry_after = extract_retry_after(exc)
+            desc = str(exc or "").lower()
+            if retry_after > 0:
+                time.sleep(min(retry_after, 60) + 1)
+                continue
+            if "too many requests" in desc or "retry after" in desc:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            return False, exc
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                time.sleep(0.35 * (attempt + 1))
+                continue
+            return False, exc
+    return False, last_exc
+
+
+def _loop_job_status_text(lang: str, group_title: str, sent: int, failed: int, batch_size: int, interval_seconds: int, round_no: int):
+    return (
+        f"♾️ {t(lang, 'loop_started')}\n\n"
+        f"📂 {t(lang, 'summary_group')}: {group_title}\n"
+        f"📦 {t(lang, 'loop_batch')}: {batch_size}\n"
+        f"⏱️ {t(lang, 'loop_interval')}: {interval_seconds}s\n"
+        f"🔁 {t(lang, 'loop_round')}: {round_no}\n"
+        f"✅ Sent: {sent}\n"
+        f"❌ Failed: {failed}\n\n"
+        f"{t(lang, 'loop_stop_hint')}"
+    )
+
+
+def _run_loop_broadcast_job(owner_user_id: int):
+    with ACTIVE_LOOP_JOBS_LOCK:
+        job = ACTIVE_LOOP_JOBS.get(owner_user_id)
+    if not job:
+        return
+
+    payload = _prepare_broadcast_media(dict(job["payload"]))
+    batch_size = max(1, int(job.get("batch_size") or 1))
+    interval_seconds = max(0, int(job.get("interval_seconds") or 0))
+    target_group_id = int(job.get("target_group_id") or 0)
+    status_chat_id = int(job.get("status_chat_id") or 0)
+    status_message_id = int(job.get("status_message_id") or 0)
+    lang = job.get("lang") or "en"
+    group_title = job.get("group_title") or str(target_group_id)
+
+    sent = 0
+    failed = 0
+    round_no = 0
+
+    try:
+        workers = get_broadcast_worker_bots()
+        if not workers:
+            try:
+                bot.edit_message_text(
+                    chat_id=status_chat_id,
+                    message_id=status_message_id,
+                    text=f"⚠️ {t(lang, 'broadcast_failed')}\nNo worker bots available.",
+                )
+            except Exception:
+                pass
+            return
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        while True:
+            with ACTIVE_LOOP_JOBS_LOCK:
+                current = ACTIVE_LOOP_JOBS.get(owner_user_id)
+                if not current or current.get("stop_event") is None or current["stop_event"].is_set():
+                    break
+
+            round_no += 1
+            futures = []
+            workers_count = len(workers)
+            max_workers = max(1, min(batch_size, workers_count, 32))
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for index in range(batch_size):
+                    worker_row, worker_bot = workers[(round_no - 1 + index) % workers_count]
+                    futures.append(executor.submit(_send_payload_with_retry, worker_bot, target_group_id, payload))
+
+                for future in as_completed(futures):
+                    ok, _result = future.result()
+                    if ok:
+                        sent += 1
+                    else:
+                        failed += 1
+
+            try:
+                bot.edit_message_text(
+                    chat_id=status_chat_id,
+                    message_id=status_message_id,
+                    text=_loop_job_status_text(lang, group_title, sent, failed, batch_size, interval_seconds, round_no),
+                    reply_markup=loop_status_keyboard(lang),
+                )
+            except Exception:
+                pass
+
+            with ACTIVE_LOOP_JOBS_LOCK:
+                current = ACTIVE_LOOP_JOBS.get(owner_user_id)
+                if not current or current.get("stop_event") is None or current["stop_event"].is_set():
+                    break
+
+            if interval_seconds > 0 and job.get("stop_event") is not None:
+                if job["stop_event"].wait(interval_seconds):
+                    break
+            elif interval_seconds == 0:
+                time.sleep(0.05)
+
+    finally:
+        _cleanup_broadcast_media(payload)
+        with ACTIVE_LOOP_JOBS_LOCK:
+            ACTIVE_LOOP_JOBS.pop(owner_user_id, None)
+        try:
+            bot.edit_message_text(
+                chat_id=status_chat_id,
+                message_id=status_message_id,
+                text=f"✅ {t(lang, 'loop_stopped')}\n\nSent: {sent}\nFailed: {failed}",
+                reply_markup=main_menu_keyboard(owner_user_id, lang),
+            )
+        except Exception:
+            pass
+
+
+def start_loop_broadcast_job(owner_user_id: int, lang: str, target_group_id: int, payload: dict, batch_size: int, interval_seconds: int, status_chat_id: int, status_message_id: int, group_title: str):
+    stop_event = threading.Event()
+    job = {
+        "owner_user_id": owner_user_id,
+        "lang": lang,
+        "target_group_id": target_group_id,
+        "payload": payload,
+        "batch_size": batch_size,
+        "interval_seconds": interval_seconds,
+        "status_chat_id": status_chat_id,
+        "status_message_id": status_message_id,
+        "group_title": group_title,
+        "stop_event": stop_event,
+    }
+    with ACTIVE_LOOP_JOBS_LOCK:
+        existing = ACTIVE_LOOP_JOBS.get(owner_user_id)
+        if existing and existing.get("stop_event") is not None:
+            try:
+                existing["stop_event"].set()
+            except Exception:
+                pass
+        ACTIVE_LOOP_JOBS[owner_user_id] = job
+
+    thread = threading.Thread(target=_run_loop_broadcast_job, args=(owner_user_id,), daemon=True)
+    thread.start()
+    return job
+
+
+def stop_loop_broadcast_job(owner_user_id: int) -> bool:
+    with ACTIVE_LOOP_JOBS_LOCK:
+        job = ACTIVE_LOOP_JOBS.get(owner_user_id)
+        if not job or job.get("stop_event") is None:
+            return False
+        job["stop_event"].set()
+        return True
 
 
 def render_group_hint():
@@ -1146,16 +1228,32 @@ def broadcast_cmd(message):
     show_broadcast_group_prompt(message.chat.id, message.from_user.id)
 
 
-@bot.message_handler(commands=["stopbroadcast"])
-def stopbroadcast_cmd(message):
+@bot.message_handler(commands=["loopbroadcast"])
+def loopbroadcast_cmd(message):
     ensure_user(message.from_user.id)
+    reset_pending(message.from_user.id)
     if not require_admin(message):
         return
     lang = current_lang(message.from_user.id)
-    if stop_active_broadcast(message.from_user.id):
-        bot.reply_to(message, t(lang, "broadcast_stop_requested"))
+    if message.chat.type != "private":
+        bot.reply_to(message, t(lang, "access_denied"))
+        return
+    if count_groups() <= 0:
+        bot.reply_to(message, t(lang, "broadcast_no_groups"))
+        return
+    set_state(message.from_user.id, "await_loop_group")
+    show_broadcast_group_prompt(message.chat.id, message.from_user.id)
+
+
+@bot.message_handler(commands=["stopbroadcast"])
+def stopbroadcast_cmd(message):
+    ensure_user(message.from_user.id)
+    lang = current_lang(message.from_user.id)
+    reset_pending(message.from_user.id)
+    if stop_loop_broadcast_job(message.from_user.id):
+        bot.reply_to(message, t(lang, "loop_stopped"), reply_markup=main_menu_keyboard(message.from_user.id, lang))
     else:
-        bot.reply_to(message, t(lang, "cancelled"))
+        bot.reply_to(message, "No active loop broadcast is running.", reply_markup=main_menu_keyboard(message.from_user.id, lang))
 
 
 @bot.message_handler(commands=["register"])
@@ -1433,6 +1531,19 @@ def choose_broadcast_group(call):
         return
 
     title = (group["title"] or group["username"] or f"Group {chat_id}").strip()
+    row = get_user(call.from_user.id)
+    state = row["state"] if row else None
+    if state == "await_loop_group":
+        set_pending(call.from_user.id, pending_group_id=chat_id, state="await_loop_batch")
+        bot.answer_callback_query(call.id, f"Selected: {title}")
+        send_or_edit(
+            call.message.chat.id,
+            f"✅ Group selected: {title}\n\n📦 How many messages should be sent in each batch?\nSend 10 for a safe default.",
+            cancel_keyboard(lang),
+            call.message.message_id,
+        )
+        return
+
     set_pending(call.from_user.id, pending_group_id=chat_id, state="await_broadcast_repeats")
     bot.answer_callback_query(call.id, f"Selected: {title}")
     send_or_edit(
@@ -1443,6 +1554,17 @@ def choose_broadcast_group(call):
     )
 
 
+@bot.callback_query_handler(func=lambda call: call.data == "loopstop")
+def loopstop_callback(call):
+    ensure_user(call.from_user.id)
+    lang = current_lang(call.from_user.id)
+    if stop_loop_broadcast_job(call.from_user.id):
+        bot.answer_callback_query(call.id, t(lang, "loop_stopped"), show_alert=True)
+    else:
+        bot.answer_callback_query(call.id, "No active loop broadcast is running.", show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "cancel")
 @bot.callback_query_handler(func=lambda call: call.data == "cancel")
 def cancel(call):
     ensure_user(call.from_user.id)
@@ -1452,7 +1574,7 @@ def cancel(call):
     send_or_edit(call.message.chat.id, t(lang, "cancelled"), main_menu_keyboard(call.from_user.id, lang), call.message.message_id)
 
 
-@bot.message_handler(content_types=SUPPORTED_BROADCAST_CONTENT_TYPES)
+@bot.message_handler(content_types=SUPPORTED_BROADCAST_CONTENT_TYPES, func=lambda message: not is_command_message(message))
 def content_router(message):
     ensure_user(message.from_user.id)
     row = get_user(message.from_user.id)
@@ -1595,35 +1717,101 @@ def content_router(message):
         repeats = max(1, int(row["pending_repeats"] or 1))
         delay = max(0, int(row["pending_delay"] or 0))
         payload = extract_broadcast_payload(message)
-        target_group_id = int(row["pending_group_id"] or 0) or None
-        reset_pending(message.from_user.id)
-
-        # Launch the broadcast in the background so it can run in chunks and be
-        # stopped without freezing the bot chat session.
         try:
-            start_background_broadcast(
-                user_id=message.from_user.id,
-                chat_id=message.chat.id,
-                lang=lang,
-                payload=payload,
+            total, sent, failed = broadcast_message_to_groups(
+                payload,
                 repeats=repeats,
                 delay_seconds=delay,
-                target_group_id=target_group_id,
+                target_group_id=int(row["pending_group_id"] or 0) or None,
             )
-            bot.reply_to(
-                message,
-                t(lang, "broadcast_started"),
-                reply_markup=main_menu_keyboard(message.from_user.id, lang),
-            )
+            result_text = f"✅ Broadcast finished.\nTargets: {total}\nSent: {sent}\nFailed: {failed}"
         except Exception as exc:
             log.exception("Broadcast crashed for user %s", message.from_user.id)
-            bot.reply_to(
-                message,
-                f"⚠️ Broadcast failed unexpectedly.\n{exc}",
-                reply_markup=main_menu_keyboard(message.from_user.id, lang),
-            )
+            total = sent = 0
+            failed = 0
+            result_text = f"⚠️ Broadcast failed unexpectedly.\n{exc}"
+        finally:
+            reset_pending(message.from_user.id)
+        bot.reply_to(
+            message,
+            result_text,
+            reply_markup=main_menu_keyboard(message.from_user.id, lang),
+        )
         return
 
+    if state == "await_loop_batch":
+        raw = (message.text or "").strip()
+        if not raw.isdigit() or int(raw) <= 0:
+            bot.reply_to(message, t(lang, "invalid_number"))
+            return
+        batch_size = min(100, int(raw))
+        set_pending(
+            message.from_user.id,
+            pending_repeats=batch_size,
+            state="await_loop_delay",
+        )
+        bot.reply_to(
+            message,
+            f"⏱️ {t(lang, 'loop_enter_interval')}\n\nSend a number from 0 to {LOOP_MAX_INTERVAL_SECONDS} seconds (5 minutes).",
+            reply_markup=cancel_keyboard(lang),
+        )
+        return
+
+    if state == "await_loop_delay":
+        raw = (message.text or "").strip()
+        if not raw.isdigit():
+            bot.reply_to(message, t(lang, "invalid_number"))
+            return
+        interval = int(raw)
+        if interval < 0 or interval > LOOP_MAX_INTERVAL_SECONDS:
+            bot.reply_to(
+                message,
+                f"⚠️ Please send a number between 0 and {LOOP_MAX_INTERVAL_SECONDS}.",
+                reply_markup=cancel_keyboard(lang),
+            )
+            return
+        set_pending(
+            message.from_user.id,
+            pending_delay=interval,
+            state="await_loop_content",
+        )
+        bot.reply_to(
+            message,
+            f"📝 {t(lang, 'loop_enter_message')}",
+            reply_markup=cancel_keyboard(lang),
+        )
+        return
+
+    if state == "await_loop_content":
+        batch_size = max(1, min(100, int(row["pending_repeats"] or 10)))
+        interval = max(0, int(row["pending_delay"] or 0))
+        group_id = int(row["pending_group_id"] or 0)
+        group = get_group_by_chat_id(group_id)
+        group_title = (group["title"] or group["username"] or f"Group {group_id}") if group else f"Group {group_id}"
+        payload = extract_broadcast_payload(message)
+        try:
+            reset_pending(message.from_user.id)
+            status_msg = bot.reply_to(
+                message,
+                _loop_job_status_text(lang, group_title, 0, 0, batch_size, interval, 1),
+                reply_markup=loop_status_keyboard(lang),
+            )
+            start_loop_broadcast_job(
+                owner_user_id=message.from_user.id,
+                lang=lang,
+                target_group_id=group_id,
+                payload=payload,
+                batch_size=batch_size,
+                interval_seconds=interval,
+                status_chat_id=status_msg.chat.id,
+                status_message_id=status_msg.message_id,
+                group_title=group_title,
+            )
+        except Exception as exc:
+            log.exception("Loop broadcast crashed for user %s", message.from_user.id)
+            reset_pending(message.from_user.id)
+            bot.reply_to(message, f"⚠️ Loop broadcast failed unexpectedly.\n{exc}", reply_markup=main_menu_keyboard(message.from_user.id, lang))
+        return
 
 def configure_webhook():
     if not BOT_TOKEN or not WEBHOOK_URL:
