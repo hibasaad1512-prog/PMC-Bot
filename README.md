@@ -39,5 +39,6 @@ If `ADMIN_IDS` is empty, admin commands are open to everyone.
 - The bot automatically sets its webhook to:
   `https://YOUR-RENDER-URL/webhook`
 - Added bots are validated with Telegram before saving.
-- `/broadcast` currently copies the exact message you send to every registered group.
+- `/broadcast` lets you choose one saved group and then sends the exact message there.
+- Groups are saved automatically when the bot joins them, and they are deactivated when the bot leaves.
 - SQLite data needs persistent storage if you want it to survive redeploys.
