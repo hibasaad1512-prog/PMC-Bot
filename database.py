@@ -1,16 +1,136 @@
+import json
 import sqlite3
 from pathlib import Path
 
-from config import DATABASE_PATH
+from config import BACKUP_PATH, DATABASE_PATH
+
 
 
 def get_connection():
     db_path = Path(DATABASE_PATH)
     if db_path.parent != Path("."):
         db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def _backup_path() -> Path:
+    path = Path(BACKUP_PATH)
+    if path.parent != Path("."):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _rows_to_dicts(rows):
+    return [dict(row) for row in rows]
+
+
+def _write_backup_snapshot():
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        snapshot = {}
+        for table in ("users", "groups", "bots"):
+            cur.execute(f"SELECT * FROM {table}")
+            snapshot[table] = _rows_to_dicts(cur.fetchall())
+        backup_file = _backup_path()
+        tmp_file = backup_file.with_suffix(backup_file.suffix + ".tmp")
+        tmp_file.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_file.replace(backup_file)
+    finally:
+        conn.close()
+
+
+def _restore_from_backup_if_needed():
+    backup_file = _backup_path()
+    if not backup_file.exists():
+        return
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) AS c FROM users")
+        users_count = int(cur.fetchone()["c"] or 0)
+        cur.execute("SELECT COUNT(*) AS c FROM groups")
+        groups_count = int(cur.fetchone()["c"] or 0)
+        cur.execute("SELECT COUNT(*) AS c FROM bots")
+        bots_count = int(cur.fetchone()["c"] or 0)
+        if users_count or groups_count or bots_count:
+            return
+
+        try:
+            snapshot = json.loads(backup_file.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        for row in snapshot.get("users", []):
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO users (
+                    user_id, language, state,
+                    pending_group_id, pending_message_chat_id, pending_message_id,
+                    pending_repeats, pending_delay,
+                    pending_bot_label, pending_bot_token, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row.get("user_id"),
+                    row.get("language"),
+                    row.get("state"),
+                    row.get("pending_group_id"),
+                    row.get("pending_message_chat_id"),
+                    row.get("pending_message_id"),
+                    row.get("pending_repeats", 1),
+                    row.get("pending_delay", 0),
+                    row.get("pending_bot_label"),
+                    row.get("pending_bot_token"),
+                    row.get("updated_at"),
+                ),
+            )
+
+        for row in snapshot.get("groups", []):
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO groups (
+                    chat_id, title, username, chat_type, is_active, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row.get("chat_id"),
+                    row.get("title"),
+                    row.get("username"),
+                    row.get("chat_type"),
+                    row.get("is_active", 1),
+                    row.get("updated_at"),
+                ),
+            )
+
+        for row in snapshot.get("bots", []):
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO bots (
+                    id, label, token, added_by, is_active, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row.get("id"),
+                    row.get("label"),
+                    row.get("token"),
+                    row.get("added_by"),
+                    row.get("is_active", 1),
+                    row.get("created_at"),
+                    row.get("updated_at"),
+                ),
+            )
+
+        conn.commit()
+    finally:
+        conn.close()
+
 
 
 def _table_columns(cur, table_name: str) -> set[str]:
@@ -76,6 +196,7 @@ def init_db():
 
     conn.commit()
     conn.close()
+    _restore_from_backup_if_needed()
 
 
 def upsert_group(chat_id: int, title: str, username: str | None, chat_type: str):
@@ -95,6 +216,7 @@ def upsert_group(chat_id: int, title: str, username: str | None, chat_type: str)
         (chat_id, title, username or "", chat_type),
     )
     conn.commit()
+    _write_backup_snapshot()
     conn.close()
 
 
@@ -185,6 +307,7 @@ def deactivate_group(chat_id: int):
     )
     conn.commit()
     updated = cur.rowcount
+    _write_backup_snapshot()
     conn.close()
     return updated > 0
 
@@ -195,6 +318,7 @@ def delete_group_record(chat_id: int):
     cur.execute("DELETE FROM groups WHERE chat_id=?", (chat_id,))
     conn.commit()
     deleted = cur.rowcount
+    _write_backup_snapshot()
     conn.close()
     return deleted > 0
 
@@ -233,6 +357,7 @@ def ensure_user(user_id: int):
         (user_id,),
     )
     conn.commit()
+    _write_backup_snapshot()
     conn.close()
 
 
@@ -249,6 +374,7 @@ def update_user(user_id: int, **fields):
         values,
     )
     conn.commit()
+    _write_backup_snapshot()
     conn.close()
 
 
@@ -294,6 +420,7 @@ def add_bot_record(label: str, token: str, added_by: int | None = None):
         (label, token, added_by),
     )
     conn.commit()
+    _write_backup_snapshot()
     conn.close()
 
 
@@ -362,6 +489,7 @@ def delete_bot_record(bot_id: int):
     cur.execute("DELETE FROM bots WHERE id=?", (bot_id,))
     conn.commit()
     deleted = cur.rowcount
+    _write_backup_snapshot()
     conn.close()
     return deleted > 0
 
@@ -375,5 +503,6 @@ def deactivate_bot_record(bot_id: int):
     )
     conn.commit()
     updated = cur.rowcount
+    _write_backup_snapshot()
     conn.close()
     return updated > 0

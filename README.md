@@ -42,3 +42,6 @@ If `ADMIN_IDS` is empty, admin commands are open to everyone.
 - `/broadcast` lets you choose one saved group and then copies the exact message there, including photos, GIFs, polls, stickers, and more.
 - Groups are saved automatically when the bot joins them, and they are deactivated when the bot leaves.
 - SQLite data needs persistent storage if you want it to survive redeploys.
+- On Render, you need a mounted persistent disk and `DATABASE_PATH=/data/pmc_bot.sqlite3` for saved bots, groups, and user states to survive restarts.
+- The app now also writes a JSON backup file next to the database and can restore from it on startup if the SQLite file is missing.
+- If you keep the service on a free instance without a disk, local files will still be ephemeral and data can be lost after restart.
