@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: pmc-bot
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    disk:
+      name: pmc-bot-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: DATABASE_PATH
+        value: /data/pmc_bot.sqlite3
+      - key: BACKUP_PATH
+        value: /data/pmc_bot_state.backup.json
+      - key: MAX_GROUPS_PER_PAGE
+        value: "5"
+      - key: MAX_REPEATS
+        value: "5000"
+      - key: MAX_DELAY_SECONDS
+        value: "3600"
