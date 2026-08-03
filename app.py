@@ -138,11 +138,25 @@ def is_admin(user_id: int) -> bool:
     return not ADMIN_IDS or user_id in ADMIN_IDS
 
 
-def require_admin(message) -> bool:
-    if is_admin(message.from_user.id):
+def require_admin(user_or_message, deny_chat_id: int | None = None) -> bool:
+    """
+    Accept either a Telegram Message/CallbackQuery-like object or a numeric user id.
+    For callback buttons, pass the clicker's user id so admin checks do not run
+    against the bot's own message author.
+    """
+    if hasattr(user_or_message, "from_user"):
+        user_id = int(getattr(user_or_message.from_user, "id"))
+        if deny_chat_id is None and hasattr(user_or_message, "chat"):
+            deny_chat_id = getattr(user_or_message.chat, "id", None)
+    else:
+        user_id = int(user_or_message)
+
+    if is_admin(user_id):
         return True
-    lang = current_lang(message.from_user.id)
-    bot.reply_to(message, t(lang, "access_denied"))
+
+    lang = current_lang(user_id)
+    if deny_chat_id is not None:
+        bot.send_message(deny_chat_id, t(lang, "access_denied"))
     return False
 
 
@@ -1404,7 +1418,7 @@ def menu_actions(call):
     lang = current_lang(call.from_user.id)
 
     if action == "addbot":
-        if not require_admin(call.message):
+        if not require_admin(call.from_user.id, call.message.chat.id):
             return
         reset_pending(call.from_user.id)
         set_state(call.from_user.id, "await_bot_label")
@@ -1415,7 +1429,7 @@ def menu_actions(call):
             call.message.message_id,
         )
     elif action == "removebot":
-        if not require_admin(call.message):
+        if not require_admin(call.from_user.id, call.message.chat.id):
             return
         show_remove_prompt(call.message.chat.id, call.from_user.id, page=0, message_id=call.message.message_id)
     elif action == "language":
@@ -1448,7 +1462,7 @@ def menu_actions(call):
             call.message.message_id,
         )
     elif action == "broadcast":
-        if not require_admin(call.message):
+        if not require_admin(call.from_user.id, call.message.chat.id):
             return
         if count_groups() <= 0:
             send_or_edit(
@@ -1468,7 +1482,7 @@ def menu_actions(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("rm_page:"))
 def paginate_remove_bots(call):
     ensure_user(call.from_user.id)
-    if not require_admin(call.message):
+    if not require_admin(call.from_user.id, call.message.chat.id):
         return
     try:
         page = max(0, int(call.data.split(":", 1)[1]))
@@ -1481,7 +1495,7 @@ def paginate_remove_bots(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("rm:"))
 def remove_bot(call):
     ensure_user(call.from_user.id)
-    if not require_admin(call.message):
+    if not require_admin(call.from_user.id, call.message.chat.id):
         return
     lang = current_lang(call.from_user.id)
     parts = call.data.split(":")
@@ -1504,7 +1518,7 @@ def remove_bot(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("grm_page:"))
 def paginate_remove_groups(call):
     ensure_user(call.from_user.id)
-    if not require_admin(call.message):
+    if not require_admin(call.from_user.id, call.message.chat.id):
         return
     try:
         page = max(0, int(call.data.split(":", 1)[1]))
@@ -1517,7 +1531,7 @@ def paginate_remove_groups(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("grm:"))
 def remove_group(call):
     ensure_user(call.from_user.id)
-    if not require_admin(call.message):
+    if not require_admin(call.from_user.id, call.message.chat.id):
         return
     parts = call.data.split(":")
     if len(parts) != 3:
@@ -1539,7 +1553,7 @@ def remove_group(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("bg_page:"))
 def paginate_broadcast_groups(call):
     ensure_user(call.from_user.id)
-    if not require_admin(call.message):
+    if not require_admin(call.from_user.id, call.message.chat.id):
         return
     try:
         page = max(0, int(call.data.split(":", 1)[1]))
@@ -1552,7 +1566,7 @@ def paginate_broadcast_groups(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("bg:"))
 def choose_broadcast_group(call):
     ensure_user(call.from_user.id)
-    if not require_admin(call.message):
+    if not require_admin(call.from_user.id, call.message.chat.id):
         return
     lang = current_lang(call.from_user.id)
     parts = call.data.split(":")
