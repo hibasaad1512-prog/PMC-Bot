@@ -15,17 +15,51 @@ def _parse_admin_ids(raw: str) -> set[int]:
     return ids
 
 
-def _default_database_path() -> str:
-    raw = os.getenv("DATABASE_PATH", "").strip()
+def _is_writable_path(candidate: Path) -> bool:
+    try:
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        test_file = candidate.parent / f".{candidate.name}.write_test"
+        test_file.write_text("ok", encoding="utf-8")
+        test_file.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_storage_path(raw_value: str | None, default_name: str, fallback_name: str) -> str:
+    candidates: list[Path] = []
+
+    raw = (raw_value or "").strip()
     if raw:
-        return raw
+        candidates.append(Path(raw))
 
-    # On Render, a mounted persistent disk is typically exposed at /data.
-    # Locally, keep the database inside the project folder so the bot still runs.
-    if os.getenv("RENDER") or Path("/data").exists():
-        return "/data/pmc_bot.sqlite3"
+    # Render persistent disks are often mounted under /data, but free
+    # instances or misconfigured deploys may not allow writing there.
+    candidates.append(Path("/data") / default_name)
 
-    return "pmc_bot.sqlite3"
+    # Always keep a local fallback inside the app workspace so the bot can
+    # still run even if /data is unavailable.
+    candidates.append(Path.cwd() / fallback_name)
+    candidates.append(Path(__file__).resolve().parent / fallback_name)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _is_writable_path(candidate):
+            return key
+
+    return str(Path.cwd() / fallback_name)
+
+
+def _default_database_path() -> str:
+    return _resolve_storage_path(
+        os.getenv("DATABASE_PATH"),
+        default_name="pmc_bot.sqlite3",
+        fallback_name="pmc_bot.sqlite3",
+    )
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -35,7 +69,13 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "pmc_secret").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
 
 DATABASE_PATH = _default_database_path()
-BACKUP_PATH = os.getenv("BACKUP_PATH", str(Path(DATABASE_PATH).with_suffix(".backup.json")))
+
+_default_backup_name = str(Path(DATABASE_PATH).with_suffix(".backup.json"))
+BACKUP_PATH = _resolve_storage_path(
+    os.getenv("BACKUP_PATH"),
+    default_name=Path(_default_backup_name).name,
+    fallback_name=_default_backup_name,
+)
 
 MAX_GROUPS_PER_PAGE = int(os.getenv("MAX_GROUPS_PER_PAGE", "5"))
 MAX_REPEATS = int(os.getenv("MAX_REPEATS", "1000"))
