@@ -45,3 +45,7 @@ If `ADMIN_IDS` is empty, admin commands are open to everyone.
 - On Render, you need a mounted persistent disk and `DATABASE_PATH=/data/pmc_bot.sqlite3` for saved bots, groups, and user states to survive restarts.
 - The app now also writes a JSON backup file next to the database and can restore from it on startup if the SQLite file is missing.
 - If you keep the service on a free instance without a disk, local files will still be ephemeral and data can be lost after restart.
+
+- On Render free, the app now falls back to writable local storage automatically if /data is unavailable.
+- Bot labels, usernames, and IDs are stored with the token so saved bots remain recognizable later.
+- If a saved bot is revoked or blocked, the app can deactivate it automatically after failures.

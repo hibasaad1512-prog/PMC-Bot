@@ -1,8 +1,14 @@
 import json
+import os
 import sqlite3
+import threading
 from pathlib import Path
 
 from config import BACKUP_PATH, DATABASE_PATH
+
+_BACKUP_LOCK = threading.RLock()
+_BACKUP_TIMER: threading.Timer | None = None
+_BACKUP_DEBOUNCE_SECONDS = float(os.getenv("BACKUP_DEBOUNCE_SECONDS", "2.0"))
 
 
 
@@ -15,6 +21,7 @@ def get_connection():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -43,6 +50,44 @@ def _write_backup_snapshot():
         tmp_file.replace(backup_file)
     finally:
         conn.close()
+
+
+def _flush_backup_timer():
+    global _BACKUP_TIMER
+    with _BACKUP_LOCK:
+        _BACKUP_TIMER = None
+
+
+def _run_backup_snapshot():
+    try:
+        _write_backup_snapshot()
+    finally:
+        _flush_backup_timer()
+
+
+def schedule_backup_snapshot():
+    """
+    Coalesce multiple write operations into one snapshot so high-frequency
+    commands do not spend time rewriting the whole backup file on every
+    mutation.
+    """
+    global _BACKUP_TIMER
+
+    if _BACKUP_DEBOUNCE_SECONDS <= 0:
+        _write_backup_snapshot()
+        return
+
+    with _BACKUP_LOCK:
+        if _BACKUP_TIMER is not None:
+            try:
+                _BACKUP_TIMER.cancel()
+            except Exception:
+                pass
+
+        timer = threading.Timer(_BACKUP_DEBOUNCE_SECONDS, _run_backup_snapshot)
+        timer.daemon = True
+        _BACKUP_TIMER = timer
+        timer.start()
 
 
 def _restore_from_backup_if_needed():
@@ -113,13 +158,17 @@ def _restore_from_backup_if_needed():
             cur.execute(
                 """
                 INSERT OR REPLACE INTO bots (
-                    id, label, token, added_by, is_active, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    id, label, token, bot_name, bot_username, bot_user_id,
+                    added_by, is_active, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row.get("id"),
                     row.get("label"),
                     row.get("token"),
+                    row.get("bot_name"),
+                    row.get("bot_username"),
+                    row.get("bot_user_id"),
                     row.get("added_by"),
                     row.get("is_active", 1),
                     row.get("created_at"),
@@ -182,6 +231,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             label TEXT NOT NULL,
             token TEXT NOT NULL UNIQUE,
+            bot_name TEXT,
+            bot_username TEXT,
+            bot_user_id INTEGER,
             added_by INTEGER,
             is_active INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -193,6 +245,9 @@ def init_db():
     # Simple migrations for existing databases.
     _ensure_column(cur, "users", "pending_bot_label", "pending_bot_label TEXT")
     _ensure_column(cur, "users", "pending_bot_token", "pending_bot_token TEXT")
+    _ensure_column(cur, "bots", "bot_name", "bot_name TEXT")
+    _ensure_column(cur, "bots", "bot_username", "bot_username TEXT")
+    _ensure_column(cur, "bots", "bot_user_id", "bot_user_id INTEGER")
 
     conn.commit()
     conn.close()
@@ -216,7 +271,7 @@ def upsert_group(chat_id: int, title: str, username: str | None, chat_type: str)
         (chat_id, title, username or "", chat_type),
     )
     conn.commit()
-    _write_backup_snapshot()
+    schedule_backup_snapshot()
     conn.close()
 
 
@@ -307,7 +362,7 @@ def deactivate_group(chat_id: int):
     )
     conn.commit()
     updated = cur.rowcount
-    _write_backup_snapshot()
+    schedule_backup_snapshot()
     conn.close()
     return updated > 0
 
@@ -318,7 +373,7 @@ def delete_group_record(chat_id: int):
     cur.execute("DELETE FROM groups WHERE chat_id=?", (chat_id,))
     conn.commit()
     deleted = cur.rowcount
-    _write_backup_snapshot()
+    schedule_backup_snapshot()
     conn.close()
     return deleted > 0
 
@@ -357,7 +412,7 @@ def ensure_user(user_id: int):
         (user_id,),
     )
     conn.commit()
-    _write_backup_snapshot()
+    schedule_backup_snapshot()
     conn.close()
 
 
@@ -374,7 +429,7 @@ def update_user(user_id: int, **fields):
         values,
     )
     conn.commit()
-    _write_backup_snapshot()
+    schedule_backup_snapshot()
     conn.close()
 
 
@@ -404,24 +459,56 @@ def reset_pending(user_id: int):
     )
 
 
-def add_bot_record(label: str, token: str, added_by: int | None = None):
+
+def get_bot_by_token(token: str):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO bots (label, token, added_by, is_active, created_at, updated_at)
-        VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        ON CONFLICT(token) DO UPDATE SET
-            label=excluded.label,
-            added_by=excluded.added_by,
-            is_active=1,
-            updated_at=CURRENT_TIMESTAMP
+        SELECT id, label, token, bot_name, bot_username, bot_user_id, added_by, is_active, created_at, updated_at
+        FROM bots
+        WHERE token=?
         """,
-        (label, token, added_by),
+        (token,),
     )
-    conn.commit()
-    _write_backup_snapshot()
+    row = cur.fetchone()
     conn.close()
+    return row
+
+
+def add_bot_record(
+    label: str,
+    token: str,
+    added_by: int | None = None,
+    bot_name: str | None = None,
+    bot_username: str | None = None,
+    bot_user_id: int | None = None,
+) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT id FROM bots WHERE token=?", (token,))
+        if cur.fetchone() is not None:
+            return False
+
+        cur.execute(
+            """
+            INSERT INTO bots (
+                label, token, bot_name, bot_username, bot_user_id,
+                added_by, is_active, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (label, token, bot_name, bot_username, bot_user_id, added_by),
+        )
+        conn.commit()
+        schedule_backup_snapshot()
+        return True
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
 
 
 def list_bots(offset: int = 0, limit: int = 100):
@@ -429,7 +516,7 @@ def list_bots(offset: int = 0, limit: int = 100):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, label, token, added_by, is_active, created_at, updated_at
+        SELECT id, label, token, bot_name, bot_username, bot_user_id, added_by, is_active, created_at, updated_at
         FROM bots
         WHERE is_active=1
         ORDER BY id ASC
@@ -447,7 +534,7 @@ def list_all_bots():
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, label, token, added_by, is_active, created_at, updated_at
+        SELECT id, label, token, bot_name, bot_username, bot_user_id, added_by, is_active, created_at, updated_at
         FROM bots
         WHERE is_active=1
         ORDER BY id ASC
@@ -472,7 +559,7 @@ def get_bot_by_id(bot_id: int):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, label, token, added_by, is_active, created_at, updated_at
+        SELECT id, label, token, bot_name, bot_username, bot_user_id, added_by, is_active, created_at, updated_at
         FROM bots
         WHERE id=?
         """,
@@ -489,7 +576,7 @@ def delete_bot_record(bot_id: int):
     cur.execute("DELETE FROM bots WHERE id=?", (bot_id,))
     conn.commit()
     deleted = cur.rowcount
-    _write_backup_snapshot()
+    schedule_backup_snapshot()
     conn.close()
     return deleted > 0
 
@@ -503,6 +590,6 @@ def deactivate_bot_record(bot_id: int):
     )
     conn.commit()
     updated = cur.rowcount
-    _write_backup_snapshot()
+    schedule_backup_snapshot()
     conn.close()
     return updated > 0

@@ -18,11 +18,14 @@ from database import (
     count_bots,
     count_groups,
     count_users,
+    deactivate_bot_record,
     deactivate_group,
     delete_bot_record,
     delete_group_record,
     ensure_user,
     find_groups_by_query,
+    get_bot_by_id,
+    get_bot_by_token,
     get_group_by_chat_id,
     get_user,
     init_db,
@@ -93,6 +96,9 @@ BROADCAST_MEDIA_SUFFIXES = {
 ACTIVE_LOOP_JOBS: dict[int, dict] = {}
 ACTIVE_LOOP_JOBS_LOCK = threading.RLock()
 LOOP_MAX_INTERVAL_SECONDS = 300  # 5 minutes
+BROADCAST_MAX_WORKERS = max(4, int(os.getenv("BROADCAST_MAX_WORKERS", "64")))
+LOOP_MAX_WORKERS = max(2, int(os.getenv("LOOP_MAX_WORKERS", "32")))
+BOT_DISABLE_AFTER_FAILS = max(1, int(os.getenv("BOT_DISABLE_AFTER_FAILS", "2")))
 
 
 def is_command_message(message) -> bool:
@@ -212,9 +218,9 @@ def remove_bots_keyboard(lang: str, page: int = 0):
         return kb
 
     for bot_row in bots:
-        label = (bot_row["label"] or "Untitled bot").strip()
-        if len(label) > 22:
-            label = label[:19] + "..."
+        label = _bot_display_label(bot_row)
+        if len(label) > 24:
+            label = label[:21] + "..."
         tail = (bot_row["token"] or "")[-6:]
         suffix = f" · {tail}" if tail else ""
         kb.add(InlineKeyboardButton(f"{label}{suffix}", callback_data=f"rm:{page}:{bot_row['id']}"))
@@ -396,16 +402,22 @@ def _extract_forwarded_chat(message):
     return None
 
 
-def validate_bot_token(token: str) -> bool:
+def inspect_bot_token(token: str):
     token = token.strip()
     if not BOT_TOKEN_RE.fullmatch(token):
-        return False
+        return None
     try:
         test_bot = telebot.TeleBot(token, parse_mode="HTML", threaded=False)
         me = test_bot.get_me()
-        return bool(me and getattr(me, "id", None))
+        if not me or not getattr(me, "id", None):
+            return None
+        return me
     except Exception:
-        return False
+        return None
+
+
+def validate_bot_token(token: str) -> bool:
+    return inspect_bot_token(token) is not None
 
 
 _BOT_INSTANCE_CACHE: dict[str, telebot.TeleBot] = {}
@@ -608,7 +620,31 @@ def _bot_name(bot_row):
     if not bot_row:
         return "engine"
     label = (bot_row["label"] or "").strip()
-    return f"{bot_row['id']}:{label}" if label else f"{bot_row['id']}"
+    username = (bot_row["bot_username"] or "").strip() if "bot_username" in bot_row.keys() else ""
+    if username:
+        username = username if username.startswith("@") else f"@{username}"
+    base = f"{bot_row['id']}:{label}" if label else f"{bot_row['id']}"
+    if username:
+        return f"{base} {username}"
+    return base
+
+
+def _bot_display_label(bot_row) -> str:
+    if not bot_row:
+        return "Untitled bot"
+    parts = []
+    for key in ("label", "bot_name", "bot_username"):
+        value = (bot_row[key] or "").strip() if key in bot_row.keys() and bot_row[key] else ""
+        if value:
+            if key == "bot_username" and not value.startswith("@"):
+                value = f"@{value}"
+            parts.append(value)
+    if not parts:
+        token = (bot_row["token"] or "").strip()
+        return f"Bot {(token[:6] + '…') if token else bot_row['id']}"
+    if len(parts) >= 2:
+        return f"{parts[0]} · {parts[1]}"
+    return parts[0]
 
 
 def _telegram_error_details(exc):
@@ -864,6 +900,24 @@ def _log_broadcast_failure(bot_row, chat_id: int, payload: dict, exc: Exception,
     )
 
 
+def _maybe_disable_unhealthy_bot(bot_row, exc: Exception):
+    if not bot_row:
+        return
+    status_code, description, _retry_after = _telegram_error_details(exc)
+    desc = (description or "").lower()
+    if status_code in (401, 403) or "unauthorized" in desc or "forbidden" in desc or "bot was blocked by the user" in desc:
+        try:
+            deactivate_bot_record(int(bot_row["id"]))
+        except Exception:
+            pass
+        try:
+            token = (bot_row["token"] or "").strip()
+            if token:
+                _BOT_INSTANCE_CACHE.pop(token, None)
+        except Exception:
+            pass
+
+
 def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: int = 0, target_group_id: int | None = None):
     if target_group_id is None:
         groups = list_groups(limit=10_000)
@@ -904,9 +958,10 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
                 except ApiTelegramException as exc:
                     last_exc = exc
                     _log_broadcast_failure(bot_row, chat_id, payload, exc, phase="broadcast")
+                    _maybe_disable_unhealthy_bot(bot_row, exc)
                     status_code, _description, retry_after = _telegram_error_details(exc)
                     if retry_after > 0 or status_code == 429:
-                        time.sleep(min(max(retry_after, 1), 60) + (0.12 * attempt))
+                        time.sleep(min(max(retry_after, 1), 30) + (0.05 * attempt))
                         continue
                     break
                 except Exception as exc:
@@ -918,7 +973,7 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    max_workers = min(32, max(8, len(groups)))
+    max_workers = min(BROADCAST_MAX_WORKERS, max(8, len(groups), len(workers) * 4))
 
     try:
         for round_index in range(repeats):
@@ -952,9 +1007,10 @@ def _send_payload_with_retry(bot_row, target_bot, chat_id: int, payload: dict, p
             last_exc = exc
             status_code, _description, retry_after = _telegram_error_details(exc)
             if retry_after > 0 or status_code == 429:
-                time.sleep(min(max(retry_after, 1), 60) + (0.15 * attempt))
+                time.sleep(min(max(retry_after, 1), 30) + (0.05 * attempt))
                 continue
             _log_broadcast_failure(bot_row, chat_id, payload, exc, phase=phase)
+            _maybe_disable_unhealthy_bot(bot_row, exc)
             return False, exc
         except Exception as exc:
             last_exc = exc
@@ -1024,7 +1080,7 @@ def _run_loop_broadcast_job(owner_user_id: int):
             round_no += 1
             futures = []
             workers_count = len(workers)
-            max_workers = max(1, min(batch_size, workers_count, 32))
+            max_workers = max(1, min(batch_size, workers_count, LOOP_MAX_WORKERS))
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 for index in range(batch_size):
@@ -1510,7 +1566,15 @@ def remove_bot(call):
         bot.answer_callback_query(call.id)
         return
 
+    bot_row = get_bot_by_id(bot_id)
     ok = delete_bot_record(bot_id)
+    if ok and bot_row is not None:
+        try:
+            token = (bot_row["token"] or "").strip()
+            if token:
+                _BOT_INSTANCE_CACHE.pop(token, None)
+        except Exception:
+            pass
     bot.answer_callback_query(call.id, t(lang, "bot_removed") if ok else t(lang, "bot_remove_failed"), show_alert=not ok)
     show_remove_prompt(call.message.chat.id, call.from_user.id, page=page, message_id=call.message.message_id)
 
@@ -1622,7 +1686,6 @@ def loopstop_callback(call):
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "cancel")
-@bot.callback_query_handler(func=lambda call: call.data == "cancel")
 def cancel(call):
     ensure_user(call.from_user.id)
     reset_pending(call.from_user.id)
@@ -1666,14 +1729,40 @@ def content_router(message):
 
     if state == "await_bot_token":
         token = (message.text or "").strip()
-        if not validate_bot_token(token):
+        me = inspect_bot_token(token)
+        if me is None:
             bot.reply_to(message, t(lang, "invalid_bot_token"))
             return
         if token == BOT_TOKEN:
             bot.reply_to(message, "Please add a follower bot token, not the engine bot token.")
             return
+        existing_bot = get_bot_by_token(token)
+        if existing_bot is not None:
+            existing_label = _bot_display_label(existing_bot)
+            bot.reply_to(
+                message,
+                t(lang, "bot_token_exists").format(label=existing_label),
+                reply_markup=cancel_keyboard(lang),
+            )
+            return
         label = (row["pending_bot_label"] or "Untitled bot").strip()[:100]
-        add_bot_record(label=label, token=token, added_by=message.from_user.id)
+        bot_name = (getattr(me, "first_name", None) or "").strip() or label
+        bot_username = (getattr(me, "username", None) or "").strip() or None
+        saved = add_bot_record(
+            label=label,
+            token=token,
+            added_by=message.from_user.id,
+            bot_name=bot_name,
+            bot_username=bot_username,
+            bot_user_id=int(getattr(me, "id", 0) or 0),
+        )
+        if not saved:
+            bot.reply_to(
+                message,
+                t(lang, "bot_token_exists").format(label="this bot"),
+                reply_markup=cancel_keyboard(lang),
+            )
+            return
         reset_pending(message.from_user.id)
         bot.reply_to(
             message,
@@ -1681,6 +1770,7 @@ def content_router(message):
             reply_markup=main_menu_keyboard(message.from_user.id, lang),
         )
         return
+
 
     if state == "await_register_target":
         chat, error = resolve_group_from_private_message(message)
