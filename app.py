@@ -50,6 +50,11 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=False)
 BOT_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
+BOT_TOKEN_FIND_RE = re.compile(r"(?<!\S)(\d+:[A-Za-z0-9_-]{20,})(?!\S)")
+BOTFATHER_BLOCK_RE = re.compile(
+    r"(?is)Here is the token for bot\s+(?P<label>.+?)(?:\s+@(?P<username>[A-Za-z0-9_]+))?:\s*(?P<token>\d+:[A-Za-z0-9_-]{20,})"
+)
+MAX_BOTS_PER_BATCH = 15
 
 BOT_ID: int | None = None
 
@@ -418,6 +423,94 @@ def inspect_bot_token(token: str):
 
 def validate_bot_token(token: str) -> bool:
     return inspect_bot_token(token) is not None
+
+
+def extract_bot_tokens_from_text(raw_text: str, limit: int = MAX_BOTS_PER_BATCH) -> list[str]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    if not raw_text:
+        return tokens
+
+    for match in BOT_TOKEN_FIND_RE.finditer(raw_text):
+        token = match.group(1).strip()
+        if token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+        if len(tokens) >= limit:
+            break
+
+    return tokens
+
+
+def extract_bot_entries_from_text(raw_text: str, limit: int = MAX_BOTS_PER_BATCH) -> list[tuple[str, str | None]]:
+    entries: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+
+    if not raw_text:
+        return entries
+
+    for match in BOTFATHER_BLOCK_RE.finditer(raw_text):
+        token = match.group("token").strip()
+        if token in seen:
+            continue
+        seen.add(token)
+
+        label = (match.group("label") or "").strip()
+        label = re.sub(r"\s+", " ", label).strip(" :\n\t")
+        if label:
+            entries.append((token, label[:100]))
+        else:
+            entries.append((token, None))
+
+        if len(entries) >= limit:
+            return entries
+
+    if not entries:
+        for token in extract_bot_tokens_from_text(raw_text, limit=limit):
+            entries.append((token, None))
+
+    return entries[:limit]
+
+
+def save_bot_from_token(
+    token: str,
+    *,
+    added_by: int,
+    fallback_label: str | None = None,
+):
+    token = token.strip()
+
+    if token == BOT_TOKEN:
+        return False, "engine_token", None
+
+    existing_bot = get_bot_by_token(token)
+    if existing_bot is not None:
+        return False, "exists", existing_bot
+
+    me = inspect_bot_token(token)
+    if me is None:
+        return False, "invalid", None
+
+    label = (fallback_label or getattr(me, "first_name", None) or "Untitled bot").strip()[:100]
+    bot_name = (getattr(me, "first_name", None) or "").strip() or label
+    bot_username = (getattr(me, "username", None) or "").strip() or None
+    bot_user_id = int(getattr(me, "id", 0) or 0)
+
+    saved = add_bot_record(
+        label=label,
+        token=token,
+        added_by=added_by,
+        bot_name=bot_name,
+        bot_username=bot_username,
+        bot_user_id=bot_user_id,
+    )
+    if not saved:
+        existing_bot = get_bot_by_token(token)
+        return False, "exists", existing_bot
+
+    return True, "saved", me
 
 
 _BOT_INSTANCE_CACHE: dict[str, telebot.TeleBot] = {}
@@ -1714,9 +1807,54 @@ def content_router(message):
         if not getattr(message, "text", None) or message.text.startswith("/"):
             bot.reply_to(message, t(lang, "text_required"))
             return
+
+        raw_text = message.text.strip()
+        entries = extract_bot_entries_from_text(raw_text)
+
+        # New batch flow: paste one message with up to 15 BotFather token blocks.
+        if entries:
+            saved_labels: list[str] = []
+            skipped_existing: list[str] = []
+            skipped_invalid: list[str] = []
+            skipped_engine: list[str] = []
+
+            for token, fallback_label in entries[:MAX_BOTS_PER_BATCH]:
+                ok, reason, data = save_bot_from_token(token, added_by=message.from_user.id, fallback_label=fallback_label)
+                if ok:
+                    me = data
+                    label = (fallback_label or "").strip() or (getattr(me, "first_name", None) or "").strip() or (getattr(me, "username", None) or "").strip() or token[:8]
+                    saved_labels.append(label)
+                elif reason == "exists":
+                    existing_label = _bot_display_label(data)
+                    skipped_existing.append(existing_label)
+                elif reason == "engine_token":
+                    skipped_engine.append("engine bot token")
+                else:
+                    skipped_invalid.append(token[:10] + "…")
+
+            reset_pending(message.from_user.id)
+
+            lines = [t(lang, "bot_batch_saved").format(count=len(saved_labels))]
+            if saved_labels:
+                lines.append("• " + "\n• ".join(saved_labels))
+            if skipped_existing:
+                lines.append(t(lang, "bot_batch_skipped_existing").format(count=len(skipped_existing)))
+            if skipped_invalid:
+                lines.append(t(lang, "bot_batch_skipped_invalid").format(count=len(skipped_invalid)))
+            if skipped_engine:
+                lines.append(t(lang, "bot_batch_skipped_engine").format(count=len(skipped_engine)))
+
+            bot.reply_to(
+                message,
+                "\n\n".join(lines),
+                reply_markup=main_menu_keyboard(message.from_user.id, lang),
+            )
+            return
+
+        # Old single-bot flow stays available.
         set_pending(
             message.from_user.id,
-            pending_bot_label=message.text.strip()[:100],
+            pending_bot_label=raw_text[:100],
             pending_bot_token=None,
             state="await_bot_token",
         )
@@ -1728,41 +1866,35 @@ def content_router(message):
         return
 
     if state == "await_bot_token":
-        token = (message.text or "").strip()
-        me = inspect_bot_token(token)
-        if me is None:
+        raw_text = (message.text or "").strip()
+        entries = extract_bot_entries_from_text(raw_text, limit=1)
+        if not entries:
             bot.reply_to(message, t(lang, "invalid_bot_token"))
             return
+        token, _maybe_label = entries[0]
         if token == BOT_TOKEN:
             bot.reply_to(message, "Please add a follower bot token, not the engine bot token.")
             return
-        existing_bot = get_bot_by_token(token)
-        if existing_bot is not None:
-            existing_label = _bot_display_label(existing_bot)
-            bot.reply_to(
-                message,
-                t(lang, "bot_token_exists").format(label=existing_label),
-                reply_markup=cancel_keyboard(lang),
-            )
-            return
         label = (row["pending_bot_label"] or "Untitled bot").strip()[:100]
-        bot_name = (getattr(me, "first_name", None) or "").strip() or label
-        bot_username = (getattr(me, "username", None) or "").strip() or None
-        saved = add_bot_record(
-            label=label,
-            token=token,
+        ok, reason, data = save_bot_from_token(
+            token,
             added_by=message.from_user.id,
-            bot_name=bot_name,
-            bot_username=bot_username,
-            bot_user_id=int(getattr(me, "id", 0) or 0),
+            fallback_label=label,
         )
-        if not saved:
-            bot.reply_to(
-                message,
-                t(lang, "bot_token_exists").format(label="this bot"),
-                reply_markup=cancel_keyboard(lang),
-            )
+        if not ok:
+            if reason == "exists":
+                existing_label = _bot_display_label(data)
+                bot.reply_to(
+                    message,
+                    t(lang, "bot_token_exists").format(label=existing_label),
+                    reply_markup=cancel_keyboard(lang),
+                )
+            elif reason == "engine_token":
+                bot.reply_to(message, "Please add a follower bot token, not the engine bot token.")
+            else:
+                bot.reply_to(message, t(lang, "invalid_bot_token"))
             return
+
         reset_pending(message.from_user.id)
         bot.reply_to(
             message,

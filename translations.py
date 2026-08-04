@@ -19,8 +19,8 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'choose_group': '📂 Select a group.',
         'send_message': '📝 Send any message you want to broadcast.\n'
                         '\n'
-                        'Supported: text, photos, videos, GIFs, documents, stickers, voice, audio, polls, location, '
-                        'contact, venue, dice, and more.',
+                        'Supported: text, photos, videos, GIFs, documents, stickers, voice, audio, polls, '
+                        'location, contact, venue, dice, and more.',
         'choose_repeats': '🔁 How many times should this message be sent?',
         'choose_delay': '⏱️ Select the delay between each send.',
         'enter_repeat_number': '✍️ Send a custom repeat count.',
@@ -37,12 +37,12 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'done': '✅ Broadcast completed.',
         'cancelled': 'Operation cancelled.',
         'registered': '✅ Group registered.',
-        'help': 'Commands:\\n/start - Start the bot\\n/help - Show help\\n/ping - Check bot status\\n/stats - View '
-                'statistics\\n/addbot - Add a bot\\n/removebot - Remove a bot\\n/groups - List registered '
-                'groups\\n/register - Register a group in private chat\\n/broadcast - Copy any message to a chosen '
-                'group\\n/loopbroadcast - Repeatedly send a message to a chosen group\\n/stopbroadcast - Stop an '
-                'active loop broadcast\\n/removegroup - Remove a group from the saved list\\n/cancel - Cancel the '
-                'current operation',
+        'help': 'Commands:\\n/start - Start the bot\\n/help - Show help\\n/ping - Check bot status\\n/stats '
+                '- View statistics\\n/addbot - Add a bot\\n/removebot - Remove a bot\\n/groups - List '
+                'registered groups\\n/register - Register a group in private chat\\n/broadcast - Copy any '
+                'message to a chosen group\\n/loopbroadcast - Repeatedly send a message to a chosen '
+                'group\\n/stopbroadcast - Stop an active loop broadcast\\n/removegroup - Remove a group from '
+                'the saved list\\n/cancel - Cancel the current operation',
         'invalid_number': '⚠️ Please send a valid number.',
         'broadcast_running': '🚀 Broadcast started...',
         'broadcast_progress': '⏳ Progress: {sent}/{total} sent, {failed} failed.',
@@ -50,8 +50,9 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'not_admin': '⛔ You must be an admin.',
         'custom': '✍️ Custom',
         'text_required': 'Please send text only.',
-        'enter_bot_label': '📛 Send a label/name for this bot.',
-        'enter_bot_token': '🔑 Now send the bot token.',
+        'enter_bot_label': '📛 Send any label for one bot, or paste up to 15 BotFather token messages in one '
+                           'text.',
+        'enter_bot_token': '🔑 Send one bot token now, or paste the full BotFather message.',
         'invalid_bot_token': '⚠️ That does not look like a valid Telegram bot token.',
         'bot_saved': '✅ Bot stored successfully: {label}',
         'bot_token_exists': '⚠️ הטוקן הזה כבר שמור. שלחו טוקן בוט אחר.',
@@ -60,8 +61,8 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'stats_bots': 'Saved bots',
         'stats_groups': 'Registered groups',
         'stats_users': 'Users',
-        'broadcast_prompt': 'Send the message you want to broadcast to all registered groups. It will be prepared once '
-                            'and sent through the stored bots.',
+        'broadcast_prompt': 'Send the message you want to broadcast to all registered groups. It will be '
+                            'prepared once and sent through the stored bots.',
         'broadcast_done': '✅ Broadcast finished.\nSent: {sent}\nFailed: {failed}',
         'broadcast_no_groups': 'No groups are registered yet.',
         'select_broadcast_group': 'Select the group you want to use for this broadcast.',
@@ -69,14 +70,18 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'broadcast_failed': 'Broadcast failed.',
         'loop_enter_batch': 'How many messages should be sent in each batch?',
         'loop_enter_interval': 'How many seconds should wait between batches? (0 to 300)',
-        'loop_enter_message': 'Send the message, photo, GIF, voice note, sticker, or other media to broadcast. It will '
-                              'be prepared once and sent through the stored bots.',
+        'loop_enter_message': 'Send the message, photo, GIF, voice note, sticker, or other media to '
+                              'broadcast. It will be prepared once and sent through the stored bots.',
         'loop_started': 'Loop broadcast started.',
         'loop_stopped': 'Loop broadcast stopped.',
         'loop_batch': 'Batch size',
         'loop_interval': 'Interval',
         'loop_round': 'Round',
-        'loop_stop_hint': 'Use /stopbroadcast or press Stop to end the loop.'},
+        'loop_stop_hint': 'Use /stopbroadcast or press Stop to end the loop.',
+        'bot_batch_saved': '✅ Saved {count} bot(s).',
+        'bot_batch_skipped_existing': '⚠️ Skipped {count} bot(s) because they were already saved.',
+        'bot_batch_skipped_invalid': '⚠️ Skipped {count} invalid token(s).',
+        'bot_batch_skipped_engine': '⚠️ Skipped {count} engine token(s).'},
  'he': {'welcome': '🤖 ברוכים הבאים ל-PMC Bot\n\nנא לבחור שפה.',
         'main_menu': '🤖 ברוכים הבאים ל-PMC Bot\n\nבחרו פעולה מהתפריט למטה.',
         'choose_action': 'בחרו פעולה:',
@@ -98,8 +103,8 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'choose_group': '📂 בחר קבוצה.',
         'send_message': '📝 שלח כל הודעה שתרצה לשדר.\n'
                         '\n'
-                        'נתמך: טקסט, תמונות, סרטונים, GIF, מסמכים, סטיקרים, קול, אודיו, סקרים, מיקום, איש קשר, מקום, '
-                        'קוביה ועוד.',
+                        'נתמך: טקסט, תמונות, סרטונים, GIF, מסמכים, סטיקרים, קול, אודיו, סקרים, מיקום, איש '
+                        'קשר, מקום, קוביה ועוד.',
         'choose_repeats': '🔁 כמה פעמים לשלוח את ההודעה?',
         'choose_delay': '⏱️ בחר השהיה בין כל שליחה.',
         'enter_repeat_number': '✍️ שלח מספר חזרות מותאם.',
@@ -116,10 +121,10 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'done': '✅ השידור הושלם.',
         'cancelled': 'הפעולה בוטלה.',
         'registered': '✅ הקבוצה נרשמה.',
-        'help': 'פקודות:\\n/start - התחלת הבוט\\n/help - עזרה\\n/ping - בדיקת מצב\\n/stats - סטטיסטיקה\\n/addbot - '
-                "הוספת בוט\\n/removebot - מחיקת בוט\\n/groups - הצגת קבוצות שמורות\\n/register - רישום קבוצה בצ'אט "
-                'הפרטי\\n/broadcast - העתקת כל הודעה לקבוצה נבחרת\\n/removegroup - מחיקת קבוצה מהרשימה\\n/cancel - '
-                'ביטול הפעולה הנוכחית',
+        'help': 'פקודות:\\n/start - התחלת הבוט\\n/help - עזרה\\n/ping - בדיקת מצב\\n/stats - '
+                'סטטיסטיקה\\n/addbot - הוספת בוט\\n/removebot - מחיקת בוט\\n/groups - הצגת קבוצות '
+                "שמורות\\n/register - רישום קבוצה בצ'אט הפרטי\\n/broadcast - העתקת כל הודעה לקבוצה "
+                'נבחרת\\n/removegroup - מחיקת קבוצה מהרשימה\\n/cancel - ביטול הפעולה הנוכחית',
         'invalid_number': '⚠️ נא לשלוח מספר תקין.',
         'broadcast_running': '🚀 השידור התחיל...',
         'broadcast_progress': '⏳ התקדמות: {sent}/{total} נשלחו, {failed} נכשלו.',
@@ -127,8 +132,8 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'not_admin': '⛔ עליך להיות מנהל.',
         'custom': '✍️ מותאם אישית',
         'text_required': 'נא לשלוח טקסט בלבד.',
-        'enter_bot_label': '📛 שלח שם/תווית עבור הבוט.',
-        'enter_bot_token': '🔑 כעת שלח את טוקן הבוט.',
+        'enter_bot_label': '📛 שלחו תווית לבוט אחד, או הדביקו עד 15 הודעות טוקן של BotFather בהודעה אחת.',
+        'enter_bot_token': '🔑 עכשיו שלחו טוקן של בוט אחד, או הדביקו את הודעת BotFather המלאה.',
         'invalid_bot_token': '⚠️ זה לא נראה כמו טוקן תקין של בוט טלגרם.',
         'bot_saved': '✅ הבוט נשמר בהצלחה: {label}',
         'bot_token_exists': '⚠️ הטוקן הזה כבר שמור. שלחו טוקן בוט אחר.',
@@ -137,8 +142,8 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'stats_bots': 'בוטים שמורים',
         'stats_groups': 'קבוצות רשומות',
         'stats_users': 'משתמשים',
-        'broadcast_prompt': 'שלחו את ההודעה שתרצו להעתיק לכל הקבוצות הרשומות. הבוט יעתיק אותה ישירות כדי להיות מהיר '
-                            'יותר.',
+        'broadcast_prompt': 'שלחו את ההודעה שתרצו להעתיק לכל הקבוצות הרשומות. הבוט יעתיק אותה ישירות כדי '
+                            'להיות מהיר יותר.',
         'broadcast_done': '✅ השידור הסתיים.\nנשלח: {sent}\nנכשל: {failed}',
         'broadcast_no_groups': 'עדיין לא נרשמו קבוצות.',
         'select_broadcast_group': 'בחרו את הקבוצה שתרצו להשתמש בה לשידור הזה.',
@@ -146,14 +151,18 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'broadcast_failed': '⚠️ השידור נכשל.',
         'loop_enter_batch': 'כמה הודעות לשלוח בכל אצווה?',
         'loop_enter_interval': 'כמה שניות להמתין בין האצוות? (0 עד 300)',
-        'loop_enter_message': 'שלחו את ההודעה, התמונה, ה-GIF, ההודעה הקולית, הסטיקר או מדיה אחרת לשידור. היא תישמר פעם '
-                              'אחת ותישלח דרך הבוטים השמורים.',
+        'loop_enter_message': 'שלחו את ההודעה, התמונה, ה-GIF, ההודעה הקולית, הסטיקר או מדיה אחרת לשידור. היא '
+                              'תישמר פעם אחת ותישלח דרך הבוטים השמורים.',
         'loop_started': 'שידור הלולאה התחיל.',
         'loop_stopped': 'שידור הלולאה נעצר.',
         'loop_batch': 'גודל אצווה',
         'loop_interval': 'מרווח',
         'loop_round': 'סבב',
-        'loop_stop_hint': 'השתמשו ב-/stopbroadcast או בלחצן Stop כדי לעצור את הלולאה.'},
+        'loop_stop_hint': 'השתמשו ב-/stopbroadcast או בלחצן Stop כדי לעצור את הלולאה.',
+        'bot_batch_saved': '✅ נשמרו {count} בוט(ים).',
+        'bot_batch_skipped_existing': '⚠️ דולגו {count} בוט(ים) כי הם כבר נשמרו.',
+        'bot_batch_skipped_invalid': '⚠️ דולגו {count} טוקן(ים) לא תקינים.',
+        'bot_batch_skipped_engine': '⚠️ דולגו {count} טוקן(ים) של הבוט הראשי.'},
  'sr': {'welcome': '🤖 Dobrodošli u PMC Bot\n\nIzaberite jezik.',
         'main_menu': '🤖 Dobrodošli u PMC Bot\n\nIzaberite akciju ispod.',
         'choose_action': 'Izaberite akciju:',
@@ -175,8 +184,8 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'choose_group': '📂 Izaberite grupu.',
         'send_message': '📝 Pošaljite poruku koju želite da objavite.\n'
                         '\n'
-                        'Podržano: tekst, fotografije, video, GIF, dokumenti, stikeri, glas, audio, ankete, lokacija, '
-                        'kontakt, mesto, kocka i još mnogo toga.',
+                        'Podržano: tekst, fotografije, video, GIF, dokumenti, stikeri, glas, audio, ankete, '
+                        'lokacija, kontakt, mesto, kocka i još mnogo toga.',
         'choose_repeats': '🔁 Koliko puta da se poruka pošalje?',
         'choose_delay': '⏱️ Izaberite pauzu između svakog slanja.',
         'enter_repeat_number': '✍️ Pošaljite prilagođen broj ponavljanja.',
@@ -213,8 +222,9 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'not_admin': '⛔ Morate biti administrator.',
         'custom': '✍️ Prilagođeno',
         'text_required': 'Pošaljite samo tekst.',
-        'enter_bot_label': '📛 Pošaljite ime/oznaku za ovaj bot.',
-        'enter_bot_token': '🔑 Sada pošaljite bot token.',
+        'enter_bot_label': '📛 Pošaljite oznaku za jedan bot ili nalepite do 15 BotFather token poruka u '
+                           'jednoj poruci.',
+        'enter_bot_token': '🔑 Pošaljite jedan bot token sada ili nalepite celu BotFather poruku.',
         'invalid_bot_token': '⚠️ To ne izgleda kao ispravan Telegram bot token.',
         'bot_saved': '✅ Bot je uspešno sačuvan: {label}',
         'bot_token_exists': '⚠️ הטוקן הזה כבר שמור. שלחו טוקן בוט אחר.',
@@ -223,8 +233,8 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'stats_bots': 'Sačuvani botovi',
         'stats_groups': 'Registrovane grupe',
         'stats_users': 'Korisnici',
-        'broadcast_prompt': 'Pošaljite poruku koju želite da kopirate u sve registrovane grupe. Engine će je kopirati '
-                            'direktno radi veće brzine.',
+        'broadcast_prompt': 'Pošaljite poruku koju želite da kopirate u sve registrovane grupe. Engine će je '
+                            'kopirati direktno radi veće brzine.',
         'broadcast_done': '✅ Objavljivanje završeno.\nPoslato: {sent}\nNeuspešno: {failed}',
         'broadcast_no_groups': 'Još nema registrovanih grupa.',
         'select_broadcast_group': 'Izaberite grupu koju želite da koristite za ovu objavu.',
@@ -232,15 +242,18 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'broadcast_failed': 'Slanje nije uspelo.',
         'loop_enter_batch': 'Koliko poruka treba poslati u svakoj seriji?',
         'loop_enter_interval': 'Koliko sekundi da se čeka između serija?',
-        'loop_enter_message': 'Pošaljite poruku, fotografiju, GIF, glasovnu poruku, stikер ili drugi medij za slanje.',
+        'loop_enter_message': 'Pošaljite poruku, fotografiju, GIF, glasovnu poruku, stikер ili drugi medij '
+                              'za slanje.',
         'loop_started': 'Ponavljano slanje je počelo.',
         'loop_stopped': 'Ponavljano slanje je zaustavljeno.',
         'loop_batch': 'Veličina serije',
         'loop_interval': 'Interval',
         'loop_round': 'Krug',
-        'loop_stop_hint': 'Koristite /stopbroadcast ili pritisnite Stop da zaustavite petlju.'}}
-
-
+        'loop_stop_hint': 'Koristite /stopbroadcast ili pritisnite Stop da zaustavite petlju.',
+        'bot_batch_saved': '✅ Sačuvano je {count} bot(ova).',
+        'bot_batch_skipped_existing': '⚠️ Preskočeno je {count} bot(ova) jer su već sačuvani.',
+        'bot_batch_skipped_invalid': '⚠️ Preskočeno je {count} neispravnih token(a).',
+        'bot_batch_skipped_engine': '⚠️ Preskočeno je {count} token(a) glavnog bota.'}}
 LANG_BUTTONS = [
     ("en", "🇺🇸 English"),
     ("he", "🇮🇱 Hebrew"),
