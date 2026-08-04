@@ -2,7 +2,6 @@ import logging
 import os
 import re
 import time
-import html
 import tempfile
 import threading
 from typing import Optional
@@ -101,6 +100,8 @@ BROADCAST_MEDIA_SUFFIXES = {
 
 ACTIVE_LOOP_JOBS: dict[int, dict] = {}
 ACTIVE_LOOP_JOBS_LOCK = threading.RLock()
+ACTIVE_ADD_BOT_BATCHES: dict[int, dict] = {}
+ACTIVE_ADD_BOT_BATCHES_LOCK = threading.RLock()
 LOOP_MAX_INTERVAL_SECONDS = 300  # 5 minutes
 BROADCAST_MAX_WORKERS = max(4, int(os.getenv("BROADCAST_MAX_WORKERS", "64")))
 LOOP_MAX_WORKERS = max(2, int(os.getenv("LOOP_MAX_WORKERS", "32")))
@@ -187,14 +188,11 @@ def main_menu_keyboard(user_id: int, lang: str | None = None):
         InlineKeyboardButton(t(lang, "menu_removebot"), callback_data="menu:removebot"),
     )
     kb.row(
-        InlineKeyboardButton(t(lang, "menu_bots"), callback_data="menu:bots"),
         InlineKeyboardButton(t(lang, "menu_language"), callback_data="menu:language"),
-    )
-    kb.row(
         InlineKeyboardButton(t(lang, "menu_help"), callback_data="menu:help"),
-        InlineKeyboardButton(t(lang, "menu_ping"), callback_data="menu:ping"),
     )
     kb.row(
+        InlineKeyboardButton(t(lang, "menu_ping"), callback_data="menu:ping"),
         InlineKeyboardButton(t(lang, "menu_stats"), callback_data="menu:stats"),
     )
     if is_admin(user_id):
@@ -249,64 +247,14 @@ def remove_bots_keyboard(lang: str, page: int = 0):
     return kb
 
 
-def _resolve_bot_username(bot_row) -> str | None:
-    username = (bot_row["bot_username"] or "").strip().lstrip("@")
-    if username:
-        return username
-
-    token = (bot_row["token"] or "").strip()
-    if not token:
-        return None
-
-    me = inspect_bot_token(token)
-    if me is None:
-        return None
-
-    username = (getattr(me, "username", None) or "").strip().lstrip("@")
-    return username or None
-
-
-def format_saved_bots_text(lang: str) -> str:
-    bots = list_all_bots()
-    if not bots:
-        return t(lang, "no_bots")
-
-    lines = [f"{t(lang, 'bots_title')} ({len(bots)})", ""]
-    for idx, bot_row in enumerate(bots, start=1):
-        label = html.escape((bot_row["label"] or bot_row["bot_name"] or "Untitled bot").strip())
-        username = _resolve_bot_username(bot_row)
-        if username:
-            mention = f'<a href="https://t.me/{html.escape(username)}">@{html.escape(username)}</a>'
-            lines.append(f"{idx}. {mention} — {label}")
-        else:
-            lines.append(f"{idx}. {label}")
-
-    return "\n".join(lines)
-
-
-def show_bots_list(chat_id: int, user_id: int, message_id: Optional[int] = None):
-    lang = current_lang(user_id)
-    text = format_saved_bots_text(lang)
-    send_or_edit(chat_id, text, main_menu_keyboard(user_id, lang), message_id, parse_mode="HTML")
-
-
-def send_or_edit(chat_id: int, text: str, reply_markup=None, message_id: Optional[int] = None, parse_mode: str | None = None):
+def send_or_edit(chat_id: int, text: str, reply_markup=None, message_id: Optional[int] = None):
     if message_id is None:
-        kwargs = {"reply_markup": reply_markup}
-        if parse_mode is not None:
-            kwargs["parse_mode"] = parse_mode
-        bot.send_message(chat_id, text, **kwargs)
+        bot.send_message(chat_id, text, reply_markup=reply_markup)
         return
     try:
-        kwargs = {"chat_id": chat_id, "message_id": message_id, "text": text, "reply_markup": reply_markup}
-        if parse_mode is not None:
-            kwargs["parse_mode"] = parse_mode
-        bot.edit_message_text(**kwargs)
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
     except Exception:
-        kwargs = {"reply_markup": reply_markup}
-        if parse_mode is not None:
-            kwargs["parse_mode"] = parse_mode
-        bot.send_message(chat_id, text, **kwargs)
+        bot.send_message(chat_id, text, reply_markup=reply_markup)
 
 
 def show_main_menu(chat_id: int, user_id: int, message_id: Optional[int] = None):
@@ -565,6 +513,40 @@ def save_bot_from_token(
         return False, "exists", existing_bot
 
     return True, "saved", me
+
+
+
+def start_addbot_batch_session(user_id: int):
+    with ACTIVE_ADD_BOT_BATCHES_LOCK:
+        ACTIVE_ADD_BOT_BATCHES[user_id] = {
+            "saved": 0,
+            "existing": 0,
+            "invalid": 0,
+            "engine": 0,
+        }
+
+
+def update_addbot_batch_session(user_id: int, *, saved: int = 0, existing: int = 0, invalid: int = 0, engine: int = 0):
+    with ACTIVE_ADD_BOT_BATCHES_LOCK:
+        session = ACTIVE_ADD_BOT_BATCHES.get(user_id)
+        if session is None:
+            session = {
+                "saved": 0,
+                "existing": 0,
+                "invalid": 0,
+                "engine": 0,
+            }
+            ACTIVE_ADD_BOT_BATCHES[user_id] = session
+        session["saved"] += saved
+        session["existing"] += existing
+        session["invalid"] += invalid
+        session["engine"] += engine
+        return dict(session)
+
+
+def finish_addbot_batch_session(user_id: int):
+    with ACTIVE_ADD_BOT_BATCHES_LOCK:
+        return ACTIVE_ADD_BOT_BATCHES.pop(user_id, None)
 
 
 _BOT_INSTANCE_CACHE: dict[str, telebot.TeleBot] = {}
@@ -1410,15 +1392,6 @@ def stats_cmd(message):
     bot.reply_to(message, text, reply_markup=main_menu_keyboard(message.from_user.id, lang))
 
 
-@bot.message_handler(commands=["bots"])
-def bots_cmd(message):
-    ensure_user(message.from_user.id)
-    if not require_admin(message):
-        return
-    lang = current_lang(message.from_user.id)
-    bot.reply_to(message, format_saved_bots_text(lang), reply_markup=main_menu_keyboard(message.from_user.id, lang), parse_mode="HTML")
-
-
 @bot.message_handler(commands=["cancel"])
 def cancel_cmd(message):
     ensure_user(message.from_user.id)
@@ -1427,18 +1400,46 @@ def cancel_cmd(message):
     bot.reply_to(message, t(lang, "cancelled"), reply_markup=main_menu_keyboard(message.from_user.id, lang))
 
 
+
 @bot.message_handler(commands=["addbot"])
 def addbot_cmd(message):
     ensure_user(message.from_user.id)
     if not require_admin(message):
         return
     reset_pending(message.from_user.id)
-    set_state(message.from_user.id, "await_bot_label")
+    start_addbot_batch_session(message.from_user.id)
+    set_state(message.from_user.id, "await_bot_batch")
     lang = current_lang(message.from_user.id)
     bot.reply_to(
         message,
-        t(lang, "enter_bot_label"),
+        "📥 Send one or more BotFather bot token messages.\n"
+        "You can paste them one by one or all together. Send /done when finished, or /cancel to stop.",
         reply_markup=cancel_keyboard(lang),
+    )
+
+
+@bot.message_handler(commands=["done"])
+def done_cmd(message):
+    ensure_user(message.from_user.id)
+    lang = current_lang(message.from_user.id)
+    row = get_user(message.from_user.id)
+    if not row or row["state"] not in ("await_bot_batch", "await_bot_label"):
+        bot.reply_to(message, "No active bot-add batch is running.", reply_markup=main_menu_keyboard(message.from_user.id, lang))
+        return
+
+    summary = finish_addbot_batch_session(message.from_user.id) or {"saved": 0, "existing": 0, "invalid": 0, "engine": 0}
+    reset_pending(message.from_user.id)
+
+    bot.reply_to(
+        message,
+        (
+            f"✅ Batch finished.\n\n"
+            f"Saved: {summary['saved']}\n"
+            f"Already saved: {summary['existing']}\n"
+            f"Invalid: {summary['invalid']}\n"
+            f"Engine token skipped: {summary['engine']}"
+        ),
+        reply_markup=main_menu_keyboard(message.from_user.id, lang),
     )
 
 
@@ -1629,21 +1630,20 @@ def menu_actions(call):
     bot.answer_callback_query(call.id)
     lang = current_lang(call.from_user.id)
 
+    
     if action == "addbot":
         if not require_admin(call.from_user.id, call.message.chat.id):
             return
         reset_pending(call.from_user.id)
-        set_state(call.from_user.id, "await_bot_label")
+        start_addbot_batch_session(call.from_user.id)
+        set_state(call.from_user.id, "await_bot_batch")
         send_or_edit(
             call.message.chat.id,
-            t(lang, "enter_bot_label"),
+            "📥 Send one or more BotFather bot token messages.\n"
+            "You can paste them one by one or all together. Send /done when finished, or /cancel to stop.",
             cancel_keyboard(lang),
             call.message.message_id,
         )
-    elif action == "bots":
-        if not require_admin(call.from_user.id, call.message.chat.id):
-            return
-        show_bots_list(call.message.chat.id, call.from_user.id, message_id=call.message.message_id)
     elif action == "removebot":
         if not require_admin(call.from_user.id, call.message.chat.id):
             return
@@ -1870,69 +1870,98 @@ def content_router(message):
 
     state = row["state"]
 
-    if state == "await_bot_label":
-        if not getattr(message, "text", None) or message.text.startswith("/"):
+    
+    if state in ("await_bot_batch", "await_bot_label"):
+        if not getattr(message, "text", None):
             bot.reply_to(message, t(lang, "text_required"))
             return
 
         raw_text = message.text.strip()
-        entries = extract_bot_entries_from_text(raw_text)
-
-        # New batch flow: paste one message with up to 15 BotFather token blocks.
-        if entries:
-            saved_labels: list[str] = []
-            skipped_existing: list[str] = []
-            skipped_invalid: list[str] = []
-            skipped_engine: list[str] = []
-
-            for token, fallback_label in entries[:MAX_BOTS_PER_BATCH]:
-                ok, reason, data = save_bot_from_token(token, added_by=message.from_user.id, fallback_label=fallback_label)
-                if ok:
-                    me = data
-                    label = (fallback_label or "").strip() or (getattr(me, "first_name", None) or "").strip() or (getattr(me, "username", None) or "").strip() or token[:8]
-                    saved_labels.append(label)
-                elif reason == "exists":
-                    existing_label = _bot_display_label(data)
-                    skipped_existing.append(existing_label)
-                elif reason == "engine_token":
-                    skipped_engine.append("engine bot token")
-                else:
-                    skipped_invalid.append(token[:10] + "…")
-
+        if raw_text.lower() in ("done", "finish", "finished"):
+            summary = finish_addbot_batch_session(message.from_user.id) or {"saved": 0, "existing": 0, "invalid": 0, "engine": 0}
             reset_pending(message.from_user.id)
-
-            lines = [t(lang, "bot_batch_saved").format(count=len(saved_labels))]
-            if saved_labels:
-                lines.append("• " + "\n• ".join(saved_labels))
-            if skipped_existing:
-                lines.append(t(lang, "bot_batch_skipped_existing").format(count=len(skipped_existing)))
-            if skipped_invalid:
-                lines.append(t(lang, "bot_batch_skipped_invalid").format(count=len(skipped_invalid)))
-            if skipped_engine:
-                lines.append(t(lang, "bot_batch_skipped_engine").format(count=len(skipped_engine)))
-
             bot.reply_to(
                 message,
-                "\n\n".join(lines),
+                (
+                    f"✅ Batch finished.\n\n"
+                    f"Saved: {summary['saved']}\n"
+                    f"Already saved: {summary['existing']}\n"
+                    f"Invalid: {summary['invalid']}\n"
+                    f"Engine token skipped: {summary['engine']}"
+                ),
                 reply_markup=main_menu_keyboard(message.from_user.id, lang),
             )
             return
 
-        # Old single-bot flow stays available.
-        set_pending(
+        entries = extract_bot_entries_from_text(raw_text)
+
+        if not entries:
+            bot.reply_to(
+                message,
+                "Send one or more BotFather token messages, or /done when finished.",
+                reply_markup=cancel_keyboard(lang),
+            )
+            return
+
+        saved_labels: list[str] = []
+        skipped_existing: list[str] = []
+        skipped_invalid: list[str] = []
+        skipped_engine: list[str] = []
+
+        for token, fallback_label in entries[:MAX_BOTS_PER_BATCH]:
+            ok, reason, data = save_bot_from_token(token, added_by=message.from_user.id, fallback_label=fallback_label)
+            if ok:
+                me = data
+                label = (fallback_label or "").strip() or (getattr(me, "first_name", None) or "").strip() or (getattr(me, "username", None) or "").strip() or token[:8]
+                saved_labels.append(label)
+            elif reason == "exists":
+                existing_label = _bot_display_label(data)
+                skipped_existing.append(existing_label)
+            elif reason == "engine_token":
+                skipped_engine.append("engine bot token")
+            else:
+                skipped_invalid.append(token[:10] + "…")
+
+        update_addbot_batch_session(
             message.from_user.id,
-            pending_bot_label=raw_text[:100],
-            pending_bot_token=None,
-            state="await_bot_token",
+            saved=len(saved_labels),
+            existing=len(skipped_existing),
+            invalid=len(skipped_invalid),
+            engine=len(skipped_engine),
         )
+
+        lines = [t(lang, "bot_batch_saved").format(count=len(saved_labels))]
+        if saved_labels:
+            lines.append("• " + "\n• ".join(saved_labels))
+        if skipped_existing:
+            lines.append(t(lang, "bot_batch_skipped_existing").format(count=len(skipped_existing)))
+        if skipped_invalid:
+            lines.append(t(lang, "bot_batch_skipped_invalid").format(count=len(skipped_invalid)))
+        if skipped_engine:
+            lines.append(t(lang, "bot_batch_skipped_engine").format(count=len(skipped_engine)))
+
+        batch = None
+        with ACTIVE_ADD_BOT_BATCHES_LOCK:
+            batch = dict(ACTIVE_ADD_BOT_BATCHES.get(message.from_user.id, {}))
+        if batch:
+            lines.append("")
+            lines.append(
+                f"Session total: {batch.get('saved', 0)} saved, {batch.get('existing', 0)} already saved, "
+                f"{batch.get('invalid', 0)} invalid, {batch.get('engine', 0)} engine token(s)."
+            )
+
+        lines.append("")
+        lines.append("Send the next BotFather message or type /done to finish.")
+
         bot.reply_to(
             message,
-            t(lang, "enter_bot_token"),
+            "\n".join(lines),
             reply_markup=cancel_keyboard(lang),
         )
         return
 
     if state == "await_bot_token":
+
         raw_text = (message.text or "").strip()
         entries = extract_bot_entries_from_text(raw_text, limit=1)
         if not entries:
