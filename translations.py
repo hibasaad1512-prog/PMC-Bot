@@ -209,7 +209,6 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
                 '/stats - Prikaži statistiku\n'
                 '/addbot - Dodaj bota\n'
                 '/removebot - Ukloni bota\n'
-                '/bots - Prikaži sačuvane botove\n'
                 '/register - Registruj grupu u privatnom chatu\n'
                 '/groups - Prikaži sačuvane grupe\n'
                 '/broadcast - Kopiraj bilo koju poruku u izabranu grupu\n'

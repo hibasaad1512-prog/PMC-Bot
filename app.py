@@ -4,7 +4,6 @@ import re
 import time
 import tempfile
 import threading
-import io
 from typing import Optional
 from urllib.parse import urlparse, unquote
 
@@ -104,8 +103,8 @@ ACTIVE_LOOP_JOBS_LOCK = threading.RLock()
 ACTIVE_ADD_BOT_BATCHES: dict[int, dict] = {}
 ACTIVE_ADD_BOT_BATCHES_LOCK = threading.RLock()
 LOOP_MAX_INTERVAL_SECONDS = 300  # 5 minutes
-BROADCAST_MAX_WORKERS = max(8, int(os.getenv("BROADCAST_MAX_WORKERS", "128")))
-LOOP_MAX_WORKERS = max(4, int(os.getenv("LOOP_MAX_WORKERS", "64")))
+BROADCAST_MAX_WORKERS = max(4, int(os.getenv("BROADCAST_MAX_WORKERS", "64")))
+LOOP_MAX_WORKERS = max(2, int(os.getenv("LOOP_MAX_WORKERS", "32")))
 BOT_DISABLE_AFTER_FAILS = max(1, int(os.getenv("BOT_DISABLE_AFTER_FAILS", "2")))
 
 
@@ -691,7 +690,8 @@ def _prepare_broadcast_media(payload: dict):
     """
     Download media once from the engine bot so every stored bot can reuse it.
     The payload becomes bot-agnostic: text stays text, and file-based media is
-    cached in memory so each stored bot uploads from a fresh in-memory buffer.
+    cached to a temporary local file that each stored bot uploads from its own
+    token/session.
     """
     content_type = payload.get("type") or "text"
     file_id = payload.get("file_id")
@@ -699,9 +699,12 @@ def _prepare_broadcast_media(payload: dict):
     if content_type not in BROADCAST_MEDIA_TYPES or not file_id:
         return payload
 
-    existing_bytes = payload.get("file_bytes")
-    if existing_bytes:
+    existing_path = payload.get("local_path")
+    if existing_path and os.path.exists(existing_path):
         return payload
+
+    if existing_path and not os.path.exists(existing_path):
+        payload.pop("local_path", None)
 
     try:
         file_info = bot.get_file(file_id)
@@ -709,8 +712,14 @@ def _prepare_broadcast_media(payload: dict):
         suffix = BROADCAST_MEDIA_SUFFIXES.get(content_type) or os.path.splitext(file_path)[1] or ".bin"
         downloaded = bot.download_file(file_info.file_path)
 
-        payload["file_bytes"] = downloaded
-        payload["file_name"] = f"{content_type}{suffix}"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        try:
+            tmp.write(downloaded)
+            tmp.flush()
+        finally:
+            tmp.close()
+
+        payload["local_path"] = tmp.name
     except Exception as exc:
         log.warning(
             "Could not cache broadcast media for content_type=%s message_id=%s: %s",
@@ -723,8 +732,6 @@ def _prepare_broadcast_media(payload: dict):
 
 
 def _cleanup_broadcast_media(payload: dict):
-    payload.pop("file_bytes", None)
-    payload.pop("file_name", None)
     local_path = payload.get("local_path")
     if not local_path:
         return
@@ -907,8 +914,6 @@ def _send_prepared_payload(target_bot, chat_id: int, payload: dict):
     content_type = payload.get("type") or "text"
     caption = payload.get("caption")
     local_path = payload.get("local_path")
-    file_bytes = payload.get("file_bytes")
-    file_name = payload.get("file_name") or f"{content_type}.bin"
 
     def _send_from_path(send_func, **kwargs):
         if not local_path:
@@ -918,54 +923,31 @@ def _send_prepared_payload(target_bot, chat_id: int, payload: dict):
         with open(local_path, "rb") as fh:
             return send_func(chat_id, fh, **kwargs)
 
-    def _send_from_bytes(send_func, **kwargs):
-        if not file_bytes:
-            raise RuntimeError(f"Prepared media bytes are missing for content_type={content_type}")
-        bio = io.BytesIO(file_bytes)
-        bio.name = file_name
-        return send_func(chat_id, bio, **kwargs)
-
     if content_type == "text":
         return target_bot.send_message(chat_id, payload.get("text") or "")
 
     if content_type == "photo":
-        if file_bytes:
-            return _send_from_bytes(target_bot.send_photo, caption=caption or None)
         return _send_from_path(target_bot.send_photo, caption=caption or None)
 
     if content_type == "video":
-        if file_bytes:
-            return _send_from_bytes(target_bot.send_video, caption=caption or None)
         return _send_from_path(target_bot.send_video, caption=caption or None)
 
     if content_type == "document":
-        if file_bytes:
-            return _send_from_bytes(target_bot.send_document, caption=caption or None)
         return _send_from_path(target_bot.send_document, caption=caption or None)
 
     if content_type == "audio":
-        if file_bytes:
-            return _send_from_bytes(target_bot.send_audio, caption=caption or None)
         return _send_from_path(target_bot.send_audio, caption=caption or None)
 
     if content_type == "voice":
-        if file_bytes:
-            return _send_from_bytes(target_bot.send_voice, caption=caption or None)
         return _send_from_path(target_bot.send_voice, caption=caption or None)
 
     if content_type == "animation":
-        if file_bytes:
-            return _send_from_bytes(target_bot.send_animation, caption=caption or None)
         return _send_from_path(target_bot.send_animation, caption=caption or None)
 
     if content_type == "video_note":
-        if file_bytes:
-            return _send_from_bytes(target_bot.send_video_note)
         return _send_from_path(target_bot.send_video_note)
 
     if content_type == "sticker":
-        if file_bytes:
-            return _send_from_bytes(target_bot.send_sticker)
         return _send_from_path(target_bot.send_sticker)
 
     if content_type == "contact":
@@ -1120,7 +1102,7 @@ def broadcast_message_to_groups(payload: dict, repeats: int = 1, delay_seconds: 
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    max_workers = max(1, min(BROADCAST_MAX_WORKERS, len(groups), max(8, len(workers) * 8)))
+    max_workers = min(BROADCAST_MAX_WORKERS, max(8, len(groups), len(workers) * 4))
 
     try:
         for round_index in range(repeats):
@@ -1227,7 +1209,7 @@ def _run_loop_broadcast_job(owner_user_id: int):
             round_no += 1
             futures = []
             workers_count = len(workers)
-            max_workers = max(1, min(batch_size, workers_count, LOOP_MAX_WORKERS, max(8, workers_count * 8)))
+            max_workers = max(1, min(batch_size, workers_count, LOOP_MAX_WORKERS))
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 for index in range(batch_size):
@@ -1498,28 +1480,6 @@ def groups_cmd(message):
         suffix = f" (@{username})" if username and not username.startswith("@") else (f" ({username})" if username else "")
         lines.append(f"• {title}{suffix} — {chat_id}")
     bot.reply_to(message, "\n".join(lines), reply_markup=main_menu_keyboard(message.from_user.id, lang))
-
-@bot.message_handler(commands=["bots"])
-def bots_cmd(message):
-    ensure_user(message.from_user.id)
-    if not require_admin(message):
-        return
-    lang = current_lang(message.from_user.id)
-    rows = list_all_bots()
-    if not rows:
-        bot.reply_to(message, t(lang, "no_bots"), reply_markup=main_menu_keyboard(message.from_user.id, lang))
-        return
-
-    lines = [f"🤖 Saved bots ({len(rows)})"]
-    for row in rows:
-        label = _bot_display_label(row)
-        username = (row["bot_username"] or "").strip()
-        if username and not username.startswith("@"):
-            username = f"@{username}"
-        mention = username or label
-        lines.append(f"• {mention}")
-    bot.reply_to(message, "\n".join(lines), reply_markup=main_menu_keyboard(message.from_user.id, lang))
-
 
 
 @bot.message_handler(commands=["broadcast"])
