@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import time
+import html
 import tempfile
 import threading
 from typing import Optional
@@ -186,11 +187,14 @@ def main_menu_keyboard(user_id: int, lang: str | None = None):
         InlineKeyboardButton(t(lang, "menu_removebot"), callback_data="menu:removebot"),
     )
     kb.row(
+        InlineKeyboardButton(t(lang, "menu_bots"), callback_data="menu:bots"),
         InlineKeyboardButton(t(lang, "menu_language"), callback_data="menu:language"),
-        InlineKeyboardButton(t(lang, "menu_help"), callback_data="menu:help"),
     )
     kb.row(
+        InlineKeyboardButton(t(lang, "menu_help"), callback_data="menu:help"),
         InlineKeyboardButton(t(lang, "menu_ping"), callback_data="menu:ping"),
+    )
+    kb.row(
         InlineKeyboardButton(t(lang, "menu_stats"), callback_data="menu:stats"),
     )
     if is_admin(user_id):
@@ -245,14 +249,64 @@ def remove_bots_keyboard(lang: str, page: int = 0):
     return kb
 
 
-def send_or_edit(chat_id: int, text: str, reply_markup=None, message_id: Optional[int] = None):
+def _resolve_bot_username(bot_row) -> str | None:
+    username = (bot_row["bot_username"] or "").strip().lstrip("@")
+    if username:
+        return username
+
+    token = (bot_row["token"] or "").strip()
+    if not token:
+        return None
+
+    me = inspect_bot_token(token)
+    if me is None:
+        return None
+
+    username = (getattr(me, "username", None) or "").strip().lstrip("@")
+    return username or None
+
+
+def format_saved_bots_text(lang: str) -> str:
+    bots = list_all_bots()
+    if not bots:
+        return t(lang, "no_bots")
+
+    lines = [f"{t(lang, 'bots_title')} ({len(bots)})", ""]
+    for idx, bot_row in enumerate(bots, start=1):
+        label = html.escape((bot_row["label"] or bot_row["bot_name"] or "Untitled bot").strip())
+        username = _resolve_bot_username(bot_row)
+        if username:
+            mention = f'<a href="https://t.me/{html.escape(username)}">@{html.escape(username)}</a>'
+            lines.append(f"{idx}. {mention} — {label}")
+        else:
+            lines.append(f"{idx}. {label}")
+
+    return "\n".join(lines)
+
+
+def show_bots_list(chat_id: int, user_id: int, message_id: Optional[int] = None):
+    lang = current_lang(user_id)
+    text = format_saved_bots_text(lang)
+    send_or_edit(chat_id, text, main_menu_keyboard(user_id, lang), message_id, parse_mode="HTML")
+
+
+def send_or_edit(chat_id: int, text: str, reply_markup=None, message_id: Optional[int] = None, parse_mode: str | None = None):
     if message_id is None:
-        bot.send_message(chat_id, text, reply_markup=reply_markup)
+        kwargs = {"reply_markup": reply_markup}
+        if parse_mode is not None:
+            kwargs["parse_mode"] = parse_mode
+        bot.send_message(chat_id, text, **kwargs)
         return
     try:
-        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
+        kwargs = {"chat_id": chat_id, "message_id": message_id, "text": text, "reply_markup": reply_markup}
+        if parse_mode is not None:
+            kwargs["parse_mode"] = parse_mode
+        bot.edit_message_text(**kwargs)
     except Exception:
-        bot.send_message(chat_id, text, reply_markup=reply_markup)
+        kwargs = {"reply_markup": reply_markup}
+        if parse_mode is not None:
+            kwargs["parse_mode"] = parse_mode
+        bot.send_message(chat_id, text, **kwargs)
 
 
 def show_main_menu(chat_id: int, user_id: int, message_id: Optional[int] = None):
@@ -1356,6 +1410,15 @@ def stats_cmd(message):
     bot.reply_to(message, text, reply_markup=main_menu_keyboard(message.from_user.id, lang))
 
 
+@bot.message_handler(commands=["bots"])
+def bots_cmd(message):
+    ensure_user(message.from_user.id)
+    if not require_admin(message):
+        return
+    lang = current_lang(message.from_user.id)
+    bot.reply_to(message, format_saved_bots_text(lang), reply_markup=main_menu_keyboard(message.from_user.id, lang), parse_mode="HTML")
+
+
 @bot.message_handler(commands=["cancel"])
 def cancel_cmd(message):
     ensure_user(message.from_user.id)
@@ -1577,6 +1640,10 @@ def menu_actions(call):
             cancel_keyboard(lang),
             call.message.message_id,
         )
+    elif action == "bots":
+        if not require_admin(call.from_user.id, call.message.chat.id):
+            return
+        show_bots_list(call.message.chat.id, call.from_user.id, message_id=call.message.message_id)
     elif action == "removebot":
         if not require_admin(call.from_user.id, call.message.chat.id):
             return

@@ -2,6 +2,7 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'main_menu': '🤖 Welcome to PMC Bot\n\nChoose an action below.',
         'choose_action': 'Choose an action:',
         'menu_addbot': '➕ Add Bot',
+        'menu_bots': '📋 My Bots',
         'menu_removebot': '➖ Remove Bot',
         'menu_language': '🌐 Language',
         'menu_help': 'ℹ️ Help',
@@ -38,7 +39,7 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'cancelled': 'Operation cancelled.',
         'registered': '✅ Group registered.',
         'help': 'Commands:\\n/start - Start the bot\\n/help - Show help\\n/ping - Check bot status\\n/stats '
-                '- View statistics\\n/addbot - Add a bot\\n/removebot - Remove a bot\\n/groups - List '
+                '- View statistics\\n/bots - Show saved bot usernames\\n/addbot - Add a bot\\n/removebot - Remove a bot\\n/groups - List '
                 'registered groups\\n/register - Register a group in private chat\\n/broadcast - Copy any '
                 'message to a chosen group\\n/loopbroadcast - Repeatedly send a message to a chosen '
                 'group\\n/stopbroadcast - Stop an active loop broadcast\\n/removegroup - Remove a group from '
@@ -58,6 +59,7 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'bot_token_exists': '⚠️ הטוקן הזה כבר שמור. שלחו טוקן בוט אחר.',
         'ping': '🏓 Pong! Bot is online.',
         'stats_title': '📊 Statistics',
+        'bots_title': '🤖 Saved bots',
         'stats_bots': 'Saved bots',
         'stats_groups': 'Registered groups',
         'stats_users': 'Users',
@@ -86,6 +88,7 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'main_menu': '🤖 ברוכים הבאים ל-PMC Bot\n\nבחרו פעולה מהתפריט למטה.',
         'choose_action': 'בחרו פעולה:',
         'menu_addbot': '➕ הוסף בוט',
+        'menu_bots': '📋 הבוטים שלי',
         'menu_removebot': '➖ מחק בוט',
         'menu_language': '🌐 שפה',
         'menu_help': 'ℹ️ עזרה',
@@ -122,7 +125,7 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'cancelled': 'הפעולה בוטלה.',
         'registered': '✅ הקבוצה נרשמה.',
         'help': 'פקודות:\\n/start - התחלת הבוט\\n/help - עזרה\\n/ping - בדיקת מצב\\n/stats - '
-                'סטטיסטיקה\\n/addbot - הוספת בוט\\n/removebot - מחיקת בוט\\n/groups - הצגת קבוצות '
+                'סטטיסטיקה\\n/bots - הצגת שמות הבוטים השמורים\\n/addbot - הוספת בוט\\n/removebot - מחיקת בוט\\n/groups - הצגת קבוצות '
                 "שמורות\\n/register - רישום קבוצה בצ'אט הפרטי\\n/broadcast - העתקת כל הודעה לקבוצה "
                 'נבחרת\\n/removegroup - מחיקת קבוצה מהרשימה\\n/cancel - ביטול הפעולה הנוכחית',
         'invalid_number': '⚠️ נא לשלוח מספר תקין.',
@@ -139,6 +142,7 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'bot_token_exists': '⚠️ הטוקן הזה כבר שמור. שלחו טוקן בוט אחר.',
         'ping': '🏓 פונג! הבוט מחובר.',
         'stats_title': '📊 סטטיסטיקה',
+        'bots_title': '🤖 בוטים שמורים',
         'stats_bots': 'בוטים שמורים',
         'stats_groups': 'קבוצות רשומות',
         'stats_users': 'משתמשים',
@@ -167,6 +171,7 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'main_menu': '🤖 Dobrodošli u PMC Bot\n\nIzaberite akciju ispod.',
         'choose_action': 'Izaberite akciju:',
         'menu_addbot': '➕ Dodaj bota',
+        'menu_bots': '📋 Moji botovi',
         'menu_removebot': '➖ Obriši bota',
         'menu_language': '🌐 Jezik',
         'menu_help': 'ℹ️ Pomoć',
@@ -207,6 +212,7 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
                 '/help - Prikaži pomoć\n'
                 '/ping - Proveri status bota\n'
                 '/stats - Prikaži statistiku\n'
+                '/bots - Prikaži sačuvana korisnička imena botova\n'
                 '/addbot - Dodaj bota\n'
                 '/removebot - Ukloni bota\n'
                 '/register - Registruj grupu u privatnom chatu\n'
@@ -230,6 +236,7 @@ LANGS = {'en': {'welcome': '🤖 Welcome to PMC Bot\n\nPlease select your langua
         'bot_token_exists': '⚠️ הטוקן הזה כבר שמור. שלחו טוקן בוט אחר.',
         'ping': '🏓 Pong! Bot je online.',
         'stats_title': '📊 Statistika',
+        'bots_title': '🤖 Sačuvani botovi',
         'stats_bots': 'Sačuvani botovi',
         'stats_groups': 'Registrovane grupe',
         'stats_users': 'Korisnici',
